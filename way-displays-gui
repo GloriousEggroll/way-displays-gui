@@ -315,15 +315,15 @@ class MonitorWidget(Gtk.Box):
 
 # send a UNIX socket IPC operation request and return the response as utf-8 string
 # ref: https://docs.python.org/3/howto/sockets.html#socket-howto
-def ipc_operation(operation):
+def ipc_operation(operation, payload=""):
     raw = b''
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         try:
 
-            # attempt to connect to the socket
+            # attempt to send to the socket
             client.connect(SOCKET_PATH)
-            client.send(f"OP: {operation}".encode("utf-8"))
+            client.send(f"OP: {operation}\n{payload}".encode("utf-8"))
 
             # read responses until the server is done
             chunk = None
@@ -1632,7 +1632,10 @@ class WayDisplaysApp(Gtk.Window):
             "true" if global_auto else "false"
         ])
 
-        subprocess.run(["way-displays", "--set", "ARRANGE_ALIGN", cfg["ARRANGE"], cfg["ALIGN"]])
+        # subprocess.run(["way-displays", "--set", "ARRANGE_ALIGN", cfg["ARRANGE"], cfg["ALIGN"]])
+        arrange = cfg["ARRANGE"]
+        align = cfg["ALIGN"]
+        ipc_operation("CFG_SET", f"CFG:\n  ARRANGE: {arrange}\n  ALIGN: {align}");
 
         # --- Write back YAML ---
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
