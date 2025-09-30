@@ -1,0 +1,1627 @@
+#!/usr/bin/env python3
+
+import gi
+import os
+import subprocess
+import yaml
+
+gi.require_version('Pango', '1.0')
+from gi.repository import Pango
+
+# GTK3 imports
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GObject, GLib
+
+CONFIG_PATH = os.path.expandvars("$HOME/.config/way-displays/cfg.yaml")
+
+class MonitorOverlay(Gtk.Window):
+    def __init__(self, name, width, height, refresh, x, y):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_decorated(False)
+        self.set_accept_focus(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_app_paintable(True)
+        self.set_opacity(0.85)
+
+        # Size and position
+        self.set_size_request(180, 70)
+        self.move(x + width // 2 - 90, y + height // 2 - 35)
+
+        label = Gtk.Label(label=f"{name}\n{width}x{height} @ {refresh:.0f}Hz")
+        label.set_justify(Gtk.Justification.CENTER)
+        self.add(label)
+        self.show_all()
+
+        # Auto-close after a few seconds
+        GObject.timeout_add(2000, self.close)
+
+class MonitorWidget(Gtk.Box):
+    def __init__(self, monitor, on_enabled_toggle=None, on_transform_change=None, on_resolution_change=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._on_resolution_change = on_resolution_change
+        self.monitor = monitor
+        self.set_margin_top(12)
+        self.set_margin_bottom(12)
+        self._on_transform_change = on_transform_change
+        self.flip_switch = None
+        name = monitor.get('NAME', 'Unknown')
+        make = monitor.get('MAKE', '')
+        model = monitor.get('MODEL', '')
+        self.pack_start(Gtk.Label(label=f"{name} ({make} {model})"), False, False, 0)
+
+        # ------------------ Resolution Combo ------------------
+        self.res_combo = Gtk.ComboBoxText()
+        current_mode = monitor.get('CURRENT', {}).get('MODE', {})
+        current_width = current_mode.get('WIDTH')
+        current_height = current_mode.get('HEIGHT')
+        current_refresh = current_mode.get('REFRESH_MHZ')
+        current_index = 0
+
+        modes = monitor.get('MODES', [])
+        for i, mode in enumerate(modes):
+            width = mode.get('WIDTH')
+            height = mode.get('HEIGHT')
+            refresh = mode.get('REFRESH_MHZ') / 1000.0 if mode.get('REFRESH_MHZ') else 0
+            mode_str = f"{width}x{height} @ {refresh:.2f}Hz"
+            self.res_combo.append_text(mode_str)
+            if (width == current_width and height == current_height and mode.get('REFRESH_MHZ') == current_refresh):
+                current_index = i
+
+        self.res_combo.set_active(current_index)
+        self.pack_start(self.res_combo, False, False, 0)
+
+        # ------------------ Enabled Switch ------------------
+        enabled = monitor.get('CURRENT', {}).get('ENABLED', True)
+        self.enable_switch = Gtk.Switch()
+        self.enable_switch.set_active(enabled)
+        self.enable_switch.connect("notify::active", self._on_enabled_toggled)
+        self._on_enabled_toggle = on_enabled_toggle
+        self.pack_start(Gtk.Label(label="Enabled"), False, False, 0)
+        align = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        align.set_halign(Gtk.Align.START)
+        align.pack_start(self.enable_switch, False, False, 0)
+        self.pack_start(align, False, False, 0)
+
+        # ------------------ VRR Switch ------------------
+        vrr_state = monitor.get('CURRENT', {}).get('VRR', False)
+        self.vrr_switch = Gtk.Switch()
+        self.vrr_switch.set_active(vrr_state)
+        self.pack_start(Gtk.Label(label="Adaptive Sync (VRR)"), False, False, 0)
+        align = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        align.set_halign(Gtk.Align.START)
+        align.pack_start(self.vrr_switch, False, False, 0)
+        self.pack_start(align, False, False, 0)
+
+        # ------------------ Orientation Buttons ------------------
+        self.pack_start(Gtk.Label(label="Orientation:"), False, False, 0)
+        rotation_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.pack_start(rotation_box, False, False, 0)
+
+        self.rotation_buttons = {}
+        rotations = [
+            ("None", "view-fullscreen-symbolic"),           # 0°
+            ("90", "object-rotate-right-symbolic"),         # 90°
+            ("180", "view-refresh-symbolic"),               # 180°
+            ("270", "object-rotate-left-symbolic"),         # 270°
+        ]
+
+        self.rotation_group = []  # for style toggling
+        for rotation, icon in rotations:
+            btn = Gtk.ToggleButton()
+            image = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+            btn.set_image(image)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_tooltip_text(f"Rotate {rotation}°" if rotation != "None" else "No rotation")
+            btn.connect("toggled", self.on_rotation_selected, rotation)
+            self.rotation_buttons[rotation] = btn
+            self.rotation_group.append(btn)
+            rotation_box.pack_start(btn, False, False, 0)
+
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(b"""
+            .orientation-button:checked {
+                background-color: #666;
+                border-radius: 4px;
+            }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        # Then apply to each button
+        for btn in self.rotation_group:
+            btn.get_style_context().add_class("orientation-button")
+
+        # Default: None selected
+        self.rotation_buttons["None"].set_active(True)
+
+        # ------------------ Flipped Toggle ------------------
+        self.flip_switch = Gtk.Switch()
+        self.flip_switch.connect("notify::active", self.on_flip_toggled)
+        self.pack_start(Gtk.Label(label="Flip"), False, False, 0)
+        flip_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        flip_box.set_halign(Gtk.Align.START)
+        flip_box.pack_start(self.flip_switch, False, False, 0)
+        self.pack_start(flip_box, False, False, 0)
+
+        # ------------------ Load Initial Transform from Config ------------------
+        transform = monitor.get("OVERRIDES", {}).get("TRANSFORM", None)
+        if transform:
+            if "FLIPPED" in str(transform).upper():
+                self.flip_switch.set_active(True)
+                if "-" in transform:
+                    rot = transform.split("-")[1].upper()
+                else:
+                    rot = "None"
+            else:
+                rot = str(transform).upper()
+
+            # Normalize rotations to keys
+            if rot in ["90", "180", "270"]:
+                self.rotation_buttons[rot].set_active(True)
+            else:
+                self.rotation_buttons["None"].set_active(True)
+
+        # ------------------ Scale Slider ------------------
+        scale_value = monitor.get("OVERRIDES", {}).get("SCALE", monitor.get("CURRENT", {}).get("SCALE", 1.0))
+        adjustment = Gtk.Adjustment(value=scale_value, lower=1.0, upper=2.5, step_increment=0.25, page_increment=0.25, page_size=0)
+        self.scale_slider = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment)
+        self.scale_slider.set_round_digits(2)
+        self.scale_slider.set_draw_value(True)
+        self.scale_slider.set_value_pos(Gtk.PositionType.RIGHT)
+        self.scale_slider.set_hexpand(True)
+        self.scale_slider.set_margin_top(6)
+        self.scale_slider.set_margin_bottom(6)
+
+        for val in [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]:
+            self.scale_slider.add_mark(val, Gtk.PositionType.BOTTOM, f"{val:.2f}")
+
+        self.scale_slider.connect("value-changed", self.on_scale_value_changed)
+
+        self.pack_start(Gtk.Label(label="Scale Override"), False, False, 0)
+        self.pack_start(self.scale_slider, False, False, 0)
+
+        if self._on_transform_change:
+            self._on_transform_change(self.monitor.get("NAME"), self.get_transform())
+
+        self.res_combo.connect("changed", self.on_resolution_changed)
+
+    # ------------------ Methods ------------------
+
+    def on_resolution_changed(self, combo):
+        active_text = combo.get_active_text()
+        if not active_text:
+            return
+
+        # Parse: "3840x2160 @ 120.00Hz"
+        try:
+            res_part, hz_part = active_text.split("@")
+            width, height = map(int, res_part.strip().split("x"))
+            refresh = float(hz_part.strip().replace("Hz", ""))
+        except ValueError:
+            print(f"Failed to parse resolution string: {active_text}")
+            return
+
+        # Save new resolution state
+        self.monitor["WIDTH"] = width
+        self.monitor["HEIGHT"] = height
+        self.monitor["REFRESH_MHZ"] = int(refresh * 1000)
+
+        # Call layout update
+        self._on_resolution_change(self.monitor["NAME"], width, height, refresh)
+
+    def _on_resolution_change(self, name, new_width, new_height, refresh):
+        if not self.layout_area:
+            return
+
+        scale = 0.08
+        widget = self.layout_area.get_widget_by_name(name)
+        if not widget:
+            return
+
+        for w, data in self.layout_area.monitor_data.items():
+            if data["name"] == name:
+                data["width"] = int(new_width * scale)
+                data["height"] = int(new_height * scale)
+                data["refresh"] = int(refresh * 1000)
+                self.layout_area._apply_transform_to_shape(w, data.get("transform"))
+
+                # Update the label text
+                frame = w.get_child()
+                box = frame.get_child()
+                label = box.get_children()[0]
+                label.set_text(f"{name}\n{new_width}x{new_height} @ {refresh:.0f}Hz")
+                break
+
+
+    def on_flip_toggled(self, switch, _param):
+        if self._on_transform_change:
+            self._on_transform_change(self.monitor.get("NAME"), self.get_transform())
+
+    def _on_enabled_toggled(self, switch, _param):
+        if self._on_enabled_toggle:
+            self._on_enabled_toggle(self)
+
+    def on_rotation_selected(self, btn, rotation):
+        # Only proceed if the clicked button was just activated
+        if not btn.get_active():
+            return
+
+        # Block signals temporarily so toggling others doesn't re-trigger this callback
+        for key, other_btn in self.rotation_buttons.items():
+            if other_btn is not btn:
+                other_btn.handler_block_by_func(self.on_rotation_selected)
+                other_btn.set_active(False)
+                other_btn.handler_unblock_by_func(self.on_rotation_selected)
+
+        # Apply the transform immediately
+        if self._on_transform_change:
+            self._on_transform_change(self.monitor.get("NAME"), self.get_transform())
+
+    def on_scale_value_changed(self, scale):
+        value = scale.get_value()
+        snapped = round(value * 4) / 4
+        if abs(snapped - value) > 0.001:
+            scale.set_value(snapped)
+
+    def get_transform(self):
+        rotation = None
+        for key, btn in self.rotation_buttons.items():
+            if btn.get_active():
+                rotation = key
+                break
+
+        flipped = False
+        if hasattr(self, "flip_switch") and self.flip_switch:
+            flipped = self.flip_switch.get_active()
+
+        if not rotation or rotation == "None":
+            return "FLIPPED" if flipped else None
+
+        transform = rotation
+        if flipped:
+            transform = f"FLIPPED-{rotation}"
+
+        return transform
+
+
+    def get_desired_state(self):
+        selected_index = self.res_combo.get_active()
+        if selected_index < 0 or selected_index >= len(self.monitor.get("MODES", [])):
+            return None
+
+        selected_mode = self.monitor["MODES"][selected_index]
+        name = self.monitor["NAME"]
+
+        return {
+            "name": name,
+            "width": selected_mode["WIDTH"],
+            "height": selected_mode["HEIGHT"],
+            "refresh": selected_mode["REFRESH_MHZ"],
+            "enabled": self.enable_switch.get_active(),
+            "vrr": self.vrr_switch.get_active(),
+            "scale": self.scale_slider.get_value(),
+            "transform": self.get_transform(),  # <--- add transform here
+        }
+
+
+def snap_to_edges(x, y, rects, width, height, margin=0):
+    snap_threshold = 30
+    original_x = x
+    original_y = y
+
+    for rx, ry, rw, rh in rects:
+        # Snap x
+        if abs(x - (rx + rw)) < snap_threshold:
+            x = rx + rw + margin
+        elif abs((x + width) - rx) < snap_threshold:
+            x = rx - width - margin
+
+        # Snap y
+        if abs(y - (ry + rh)) < snap_threshold:
+            y = ry + rh + margin
+        elif abs((y + height) - ry) < snap_threshold:
+            y = ry - height - margin
+
+    return x, y
+
+def rotated_dimensions(width, height, transform):
+    """Returns width and height adjusted for rotation."""
+    transform = str(transform)
+    if transform in ("90", "270"):
+        return height, width  # Swap if portrait
+    return width, height
+
+class MonitorLayout(Gtk.Layout):
+    def __init__(self, monitors, notebook, name_to_tab_index, align=None, arrange=None, order=None, transform_overrides=None):
+        super().__init__()
+        self.align = align
+        self.arrange = arrange
+        self._current_arrange = arrange.upper()
+        self._current_align = align.upper()
+        self.set_size(1000, 600)
+        self.monitor_data = {}
+        self.notebook = notebook
+        self.name_to_tab_index = name_to_tab_index
+        self.drag_data = {"widget": None, "dx": 0, "dy": 0}
+        self.last_allocated_size = (self.get_allocated_width(), self.get_allocated_height())
+        self.connect("size-allocate", self.on_resize_recenter)
+        self.arrange_mode = "ROW"
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(b"""
+            .monitor-frame {
+                background-color: #4a90e2;
+                border-radius: 6px;
+            }
+            #flip-indicator {
+                font-size: 10px;
+                color: white;
+            }
+            .snap-flash {
+                border: 2px solid #00ffff;
+                border-radius: 4px;
+                transition: border 100ms ease-in-out;
+            }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        transform_overrides = transform_overrides or {}
+        # --- Load config for arrange/align/order ---
+        config_arrange, config_align, config_order = "ROW", "TOP", []
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r") as f:
+                cfg = yaml.safe_load(f)
+                config_arrange = cfg.get("ARRANGE", "ROW")
+                config_align = cfg.get("ALIGN", "TOP")
+                config_order = cfg.get("ORDER", [])
+
+        # Respect constructor align override
+        align = (align or config_align or "TOP").upper()
+        arrange = (arrange or config_arrange or "ROW").upper()
+        order = order or config_order or []
+        self._current_align = align
+        self._current_arrange = arrange
+        self._current_order = order
+
+        # Filter monitors in ORDER, then append any missing ones
+        monitor_map = {m["NAME"]: m for m in monitors if m.get("CURRENT", {}).get("ENABLED", True)}
+        ordered_monitors = []
+        seen_names = set()
+
+        for name in order:
+            if name in monitor_map:
+                m = monitor_map[name]
+                m = m.copy()  # shallow copy is fine unless deeply nested, adjust if needed
+                m["OVERRIDES"] = {}
+                if transform_overrides and name in transform_overrides:
+                    m["OVERRIDES"]["TRANSFORM"] = transform_overrides[name]
+                ordered_monitors.append(m)
+                seen_names.add(name)
+
+        # Append any not in ORDER
+        for name, m in monitor_map.items():
+            if name not in seen_names:
+                m = m.copy()
+                m["OVERRIDES"] = {}
+                if transform_overrides and name in transform_overrides:
+                    m["OVERRIDES"]["TRANSFORM"] = transform_overrides[name]
+                ordered_monitors.append(m)
+
+        # Create monitor widgets and compute their sizes
+        scale = 0.08
+        monitor_widgets = []
+        for mon in ordered_monitors:
+            name = mon["NAME"]
+            mode = mon.get("CURRENT", {}).get("MODE", {})
+            width = mode.get("WIDTH", 1920)
+            height = mode.get("HEIGHT", 1080)
+            refresh = mode.get("REFRESH_MHZ", 60000) / 1000.0
+            transform = mon.get("OVERRIDES", {}).get("TRANSFORM", 0)
+
+            # Rotate dimensions if portrait
+            if str(transform) in ("90", "270"):
+                width, height = height, width
+
+            w, h = int(width * scale), int(height * scale)
+
+            frame = Gtk.Frame()
+            frame.set_size_request(w, h)
+            frame.set_shadow_type(Gtk.ShadowType.IN)
+            frame.get_style_context().add_class("monitor-frame")
+
+            rotated_w, rotated_h = rotated_dimensions(width, height, transform)
+            label = Gtk.Label(label=f"{name}\n{width}x{height} @ {refresh:.0f}Hz")
+            label.set_justify(Gtk.Justification.CENTER)
+
+            box = Gtk.Box()
+            box.set_halign(Gtk.Align.FILL)
+            box.set_valign(Gtk.Align.FILL)
+            box.pack_start(label, True, True, 0)
+            frame.add(box)
+
+            eventbox = Gtk.EventBox()
+            eventbox.add(frame)
+            eventbox.set_visible_window(False)
+            eventbox.set_events(
+                Gdk.EventMask.BUTTON_PRESS_MASK |
+                Gdk.EventMask.BUTTON_RELEASE_MASK |
+                Gdk.EventMask.POINTER_MOTION_MASK
+            )
+            eventbox.connect("button-press-event", self.on_drag_start)
+            eventbox.connect("motion-notify-event", self.on_drag_move)
+            eventbox.connect("button-release-event", self.on_drag_end)
+            eventbox.connect("button-press-event", self.on_shape_clicked, name)
+
+            monitor_widgets.append((eventbox, name, w, h, transform))
+
+        # --- Calculate layout positions ---
+        padding = 0  # No gaps between
+        total_width = total_height = 0
+        max_width = max_height = 0
+        for _, _, w, h, _ in monitor_widgets:
+            total_width += w + padding
+            total_height += h + padding
+            max_width = max(max_width, w)
+            max_height = max(max_height, h)
+
+        layout_w = self.get_allocated_width() or 1000
+        layout_h = self.get_allocated_height() or 600
+
+        # Determine total group size
+        if arrange == "ROW":
+            group_width = sum(w for _, _, w, _, _ in monitor_widgets)
+            group_height = max_height
+        else:
+            group_width = max_width
+            group_height = sum(h for _, _, _, h, _ in monitor_widgets)
+
+        # Center point for layout
+        offset_x = (layout_w - group_width) // 2
+        offset_y = (layout_h - group_height) // 2
+
+        # Place widgets
+        x_cursor = offset_x
+        y_cursor = offset_y
+
+        for eventbox, name, w, h, transform in monitor_widgets:
+            # Alignment
+            if arrange == "ROW":
+                y = y_cursor
+                if align == "MIDDLE":
+                    y += (max_height - h) // 2
+                elif align == "BOTTOM":
+                    y += (max_height - h)
+                x = x_cursor
+                x_cursor += w + padding
+            else:  # COLUMN
+                x = x_cursor
+                if align == "MIDDLE":
+                    x += (max_width - w) // 2
+                elif align == "RIGHT":
+                    x += (max_width - w)
+                y = y_cursor
+                y_cursor += h + padding
+
+            self.put(eventbox, x, y)
+
+            self.monitor_data[eventbox] = {
+                "name": name,
+                "width": w,
+                "height": h,
+                "x": x,
+                "y": y,
+                "transform": transform
+            }
+
+            self._apply_transform_to_shape(eventbox, transform)
+
+        self._snap_monitors_to_edges()
+
+    def flash_widget_border(self, widget):
+        # Apply a temporary CSS class for visual flash
+        style_context = widget.get_style_context()
+        style_context.add_class("snap-flash")
+
+        # Remove the class after 150ms
+        GLib.timeout_add(150, lambda: style_context.remove_class("snap-flash"))
+
+
+    def _snap_to_alignment(self, widget, x, y):
+        info = self.monitor_data[widget]
+        w, h = info["width"], info["height"]
+        center_x = x + w // 2
+        center_y = y + h // 2
+
+        SNAP_TOLERANCE = 20
+        best_x, best_y = x, y
+
+        if self.arrange_mode == "ROW":
+            # Snap y based on top, middle, bottom of neighbors
+            for other, data in self.monitor_data.items():
+                if other == widget:
+                    continue
+                top = data["y"]
+                mid = data["y"] + data["height"] // 2 - h // 2
+                bottom = data["y"] + data["height"] - h
+
+                if abs(y - top) <= SNAP_TOLERANCE:
+                    best_y = top
+                elif abs(y - mid) <= SNAP_TOLERANCE:
+                    best_y = mid
+                elif abs(y - bottom) <= SNAP_TOLERANCE:
+                    best_y = bottom
+
+        elif self.arrange_mode == "COLUMN":
+            # Snap x based on left, middle, right of neighbors
+            for other, data in self.monitor_data.items():
+                if other == widget:
+                    continue
+                left = data["x"]
+                mid = data["x"] + data["width"] // 2 - w // 2
+                right = data["x"] + data["width"] - w
+
+                if abs(x - left) <= SNAP_TOLERANCE:
+                    best_x = left
+                elif abs(x - mid) <= SNAP_TOLERANCE:
+                    best_x = mid
+                elif abs(x - right) <= SNAP_TOLERANCE:
+                    best_x = right
+
+        return best_x, best_y
+
+    def _auto_snap_alignment(self):
+        if not self.monitor_data:
+            return
+
+        positions = []
+        for eventbox, meta in self.monitor_data.items():
+            widget = self.get_widget_by_name(meta["name"])
+            if widget:
+                alloc = widget.get_allocation()
+                positions.append({
+                    "name": meta["name"],
+                    "widget": widget,
+                    "x": alloc.x,
+                    "y": alloc.y,
+                    "w": alloc.width,
+                    "h": alloc.height,
+                })
+
+        if len(positions) < 2:
+            return  # Nothing to align to
+
+        # Determine orientation: row or column
+        x_vals = [pos["x"] for pos in positions]
+        y_vals = [pos["y"] for pos in positions]
+        is_row = (max(x_vals) - min(x_vals)) >= (max(y_vals) - min(y_vals))
+
+        reference = positions[0]  # The first monitor is the reference
+        for pos in positions[1:]:
+            if is_row:
+                # --- ROW layout (align vertically) ---
+                top_diff = abs(pos["y"] - reference["y"])
+                center_diff = abs((pos["y"] + pos["h"] // 2) - (reference["y"] + reference["h"] // 2))
+                bottom_diff = abs((pos["y"] + pos["h"]) - (reference["y"] + reference["h"]))
+
+                min_diff = min(top_diff, center_diff, bottom_diff)
+
+                if min_diff == top_diff:
+                    new_y = reference["y"]
+                elif min_diff == center_diff:
+                    new_y = reference["y"] + reference["h"] // 2 - pos["h"] // 2
+                else:
+                    new_y = reference["y"] + reference["h"] - pos["h"]
+
+                pos["widget"].set_margin_top(new_y)  # snap vertically
+            else:
+                # --- COLUMN layout (align horizontally) ---
+                left_diff = abs(pos["x"] - reference["x"])
+                center_diff = abs((pos["x"] + pos["w"] // 2) - (reference["x"] + reference["w"] // 2))
+                right_diff = abs((pos["x"] + pos["w"]) - (reference["x"] + reference["w"]))
+
+                min_diff = min(left_diff, center_diff, right_diff)
+
+                if min_diff == left_diff:
+                    new_x = reference["x"]
+                elif min_diff == center_diff:
+                    new_x = reference["x"] + reference["w"] // 2 - pos["w"] // 2
+                else:
+                    new_x = reference["x"] + reference["w"] - pos["w"]
+
+                pos["widget"].set_margin_start(new_x)  # snap horizontally
+
+
+
+
+    def get_widget_by_name(self, name):
+        for widget, data in self.monitor_data.items():
+            if data["name"] == name:
+                return widget
+        return None
+
+    def update_widget_transform(self, eventbox, transform):
+        meta = self.monitor_data[eventbox]
+        meta["transform"] = transform
+
+        if transform and ("90" in transform or "270" in transform):
+            meta["width"], meta["height"] = meta["height"], meta["width"]
+        else:
+            meta["width"] = meta.get("base_width", meta["width"])
+            meta["height"] = meta.get("base_height", meta["height"])
+
+        self._apply_transform_to_shape(eventbox, transform)
+
+
+    def _apply_transform_to_shape(self, eventbox, transform):
+        name = self.monitor_data[eventbox]["name"]
+
+        frame = eventbox.get_child()
+        if not isinstance(frame, Gtk.Frame):
+            return
+
+        box = frame.get_child()
+        if not isinstance(box, Gtk.Box):
+            return
+
+        # Remove old flip indicator
+        for child in box.get_children():
+            if isinstance(child, Gtk.Label) and child.get_name() == "flip-indicator":
+                box.remove(child)
+
+        transform_str = str(transform).upper() if transform else "NONE"
+
+        original_w = self.monitor_data[eventbox]["width"]
+        original_h = self.monitor_data[eventbox]["height"]
+
+        # Default to original dimensions
+        w, h = original_w, original_h
+
+        if "90" in transform_str or "270" in transform_str:
+            w, h = original_h, original_w  # Swap for portrait
+
+        if transform in [90, 270]:
+            w, h = h, w
+
+        frame.set_size_request(w, h)
+
+        if "FLIPPED" in transform_str:
+            flip_label = Gtk.Label(label="↻")
+            flip_label.set_halign(Gtk.Align.END)
+            flip_label.set_valign(Gtk.Align.START)
+            flip_label.set_margin_top(2)
+            flip_label.set_margin_end(4)
+            flip_label.set_name("flip-indicator")
+            box.pack_start(flip_label, False, False, 0)
+
+        box.show_all()
+
+    def _update_flipped_icon(self, widget, show):
+        # Remove old icon if any
+        if hasattr(widget, "_flip_icon"):
+            widget.remove(widget._flip_icon)
+            del widget._flip_icon
+
+        if show:
+            icon = Gtk.Image.new_from_icon_name("object-flip-vertical", Gtk.IconSize.MENU)
+            icon.set_halign(Gtk.Align.END)
+            icon.set_valign(Gtk.Align.START)
+            widget._flip_icon = icon
+            widget.add(icon)
+            icon.show()
+
+    def apply_transform_visuals(self, widget, transform):
+        frame = widget.get_child()
+        box = frame.get_child()
+
+        # Remove old flip icon if any
+        for child in box.get_children():
+            if isinstance(child, Gtk.Image) and getattr(child, "is_flip_icon", False):
+                box.remove(child)
+
+        # Parse rotation and flip
+        rotation = 0
+        is_flipped = False
+
+        if transform:
+            if transform.startswith("FLIPPED"):
+                is_flipped = True
+                if "-" in transform:
+                    rotation = int(transform.split("-")[1])
+            elif transform.isdigit():
+                rotation = int(transform)
+
+        # Apply CSS transform via style context
+        style = frame.get_style_context()
+        style.remove_class("rotate-90")
+        style.remove_class("rotate-180")
+        style.remove_class("rotate-270")
+        if rotation == 90:
+            style.add_class("rotate-90")
+        elif rotation == 180:
+            style.add_class("rotate-180")
+        elif rotation == 270:
+            style.add_class("rotate-270")
+
+        # Add flipped icon
+        if is_flipped:
+            icon = Gtk.Image.new_from_icon_name("object-flip-vertical-symbolic", Gtk.IconSize.SMALL_TOOLBAR)
+            icon.set_halign(Gtk.Align.END)
+            icon.set_valign(Gtk.Align.START)
+            icon.is_flip_icon = True
+            box.pack_start(icon, False, False, 0)
+            box.reorder_child(icon, 0)
+
+
+    def add_monitor(self, monitor):
+        name = monitor["NAME"]
+        if name in [data["name"] for data in self.monitor_data.values()]:
+            return  # Already added
+
+        mode = monitor.get("CURRENT", {}).get("MODE", {})
+        width = mode.get("WIDTH", 1920)
+        height = mode.get("HEIGHT", 1080)
+        refresh = mode.get("REFRESH_MHZ", 60000) / 1000.0
+        w, h = int(width * 0.10), int(height * 0.10)
+
+        frame = Gtk.Frame()
+        frame.set_size_request(w, h)
+        frame.set_shadow_type(Gtk.ShadowType.IN)
+        frame.get_style_context().add_class("monitor-frame")
+
+        label = Gtk.Label(label=f"{name}\n{width}x{height} @ {refresh:.0f}Hz")
+        label.set_justify(Gtk.Justification.CENTER)
+
+        box = Gtk.Box()
+        box.set_halign(Gtk.Align.FILL)
+        box.set_valign(Gtk.Align.FILL)
+        box.pack_start(label, True, True, 0)
+        frame.add(box)
+
+        eventbox = Gtk.EventBox()
+        eventbox.add(frame)
+        eventbox.set_visible_window(False)
+        eventbox.set_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        eventbox.connect("button-press-event", self.on_drag_start)
+        eventbox.connect("motion-notify-event", self.on_drag_move)
+        eventbox.connect("button-release-event", self.on_drag_end)
+
+        # Place it in the center
+        x = (self.get_allocated_width() - w) // 2
+        y = (self.get_allocated_height() - h) // 2
+        self.put(eventbox, x, y)
+        self.monitor_data[eventbox] = {
+            "name": name,
+            "monitor": mon,
+            "width": w,
+            "height": h,
+            "x": x,
+            "y": y,
+            "transform": transform
+        }
+        self.show_all()
+
+    def remove_monitor(self, name):
+        to_remove = None
+        for widget, data in self.monitor_data.items():
+            if data["name"] == name:
+                to_remove = widget
+                break
+        if to_remove:
+            self.remove(to_remove)
+            del self.monitor_data[to_remove]
+            self.queue_draw()
+
+    def on_resize_recenter(self, widget, allocation):
+        old_w, old_h = self.last_allocated_size
+        new_w, new_h = allocation.width, allocation.height
+        # Only recenter if window *grew* in either direction
+        if new_w > old_w or new_h > old_h:
+            GLib.idle_add(self.recenter_all_monitors)
+
+        self.last_allocated_size = (new_w, new_h)
+
+    def _snap_monitors_to_edges(self, tolerance=20):
+        items = list(self.monitor_data.items())
+
+        for i, (widget_a, data_a) in enumerate(items):
+            ax, ay = data_a["x"], data_a["y"]
+            aw, ah = data_a["width"], data_a["height"]
+
+            for j, (widget_b, data_b) in enumerate(items):
+                if i == j:
+                    continue
+
+                bx, by = data_b["x"], data_b["y"]
+                bw, bh = data_b["width"], data_b["height"]
+
+                # Snap left/right
+                if abs((ax + aw) - bx) <= tolerance:
+                    ax = bx - aw
+                elif abs(ax - (bx + bw)) <= tolerance:
+                    ax = bx + bw
+
+                # Snap top/bottom
+                if abs((ay + ah) - by) <= tolerance:
+                    ay = by - ah
+                elif abs(ay - (by + bh)) <= tolerance:
+                    ay = by + bh
+
+            self.move(widget_a, ax, ay)
+            self.monitor_data[widget_a]["x"] = ax
+            self.monitor_data[widget_a]["y"] = ay
+
+    def recenter_all_monitors(self):
+        if not self.monitor_data:
+            return
+
+        layout_width = self.get_allocated_width()
+        layout_height = self.get_allocated_height()
+
+        arrange = getattr(self, "_current_arrange", "ROW").upper()
+        align = getattr(self, "_current_align", "TOP").upper()
+
+        widgets = list(self.monitor_data.items())
+
+        if arrange == "ROW":
+            rotated_widgets = []
+            total_width = 0
+            for widget, data in widgets:
+                transform = data.get("OVERRIDES", {}).get("TRANSFORM")
+                w, h = rotated_dimensions(data["width"], data["height"], transform)
+                total_width += w
+                rotated_widgets.append((widget, w, h))
+
+            start_x = (layout_width - total_width) // 2
+
+            if align == "MIDDLE":
+                center_y = layout_height // 2
+                x = start_x
+                for widget, w, h in rotated_widgets:
+                    y = center_y - h // 2
+                    self.move(widget, x, y)
+                    self.monitor_data[widget]["x"] = x
+                    self.monitor_data[widget]["y"] = y
+                    x += w
+
+            elif align == "TOP":
+                first_h = rotated_widgets[0][2]
+                top_y = (layout_height // 2) - (first_h // 2)
+                x = start_x
+                for widget, w, h in rotated_widgets:
+                    y = top_y
+                    self.move(widget, x, y)
+                    self.monitor_data[widget]["x"] = x
+                    self.monitor_data[widget]["y"] = y
+                    x += w
+
+            elif align == "BOTTOM":
+                first_h = rotated_widgets[0][2]
+                bottom_y = (layout_height // 2) + (first_h // 2)
+                x = start_x
+                for widget, w, h in rotated_widgets:
+                    y = bottom_y - h
+                    self.move(widget, x, y)
+                    self.monitor_data[widget]["x"] = x
+                    self.monitor_data[widget]["y"] = y
+                    x += w
+
+        elif arrange == "COLUMN":
+            rotated_widgets = []
+            total_height = 0
+            for widget, data in widgets:
+                transform = data.get("OVERRIDES", {}).get("TRANSFORM")
+                w, h = rotated_dimensions(data["width"], data["height"], transform)
+                total_height += h
+                rotated_widgets.append((widget, w, h))
+
+            start_y = (layout_height - total_height) // 2
+
+            if align == "MIDDLE":
+                center_x = layout_width // 2
+                y = start_y
+                for widget, w, h in rotated_widgets:
+                    x = center_x - w // 2
+                    self.move(widget, x, y)
+                    self.monitor_data[widget]["x"] = x
+                    self.monitor_data[widget]["y"] = y
+                    y += h
+
+            elif align == "LEFT":
+                first_w = rotated_widgets[0][1]
+                left_x = (layout_width // 2) - (first_w // 2)
+                y = start_y
+                for widget, w, h in rotated_widgets:
+                    x = left_x
+                    self.move(widget, x, y)
+                    self.monitor_data[widget]["x"] = x
+                    self.monitor_data[widget]["y"] = y
+                    y += h
+
+            elif align == "RIGHT":
+                first_w = rotated_widgets[0][1]
+                right_x = (layout_width // 2) + (first_w // 2)
+                y = start_y
+                for widget, w, h in rotated_widgets:
+                    x = right_x - w
+                    self.move(widget, x, y)
+                    self.monitor_data[widget]["x"] = x
+                    self.monitor_data[widget]["y"] = y
+                    y += h
+
+
+
+
+    def on_drag_start(self, widget, event):
+        if widget not in self.monitor_data:
+            return
+
+        self.drag_data = {
+            "widget": widget,
+            "dx": event.x,
+            "dy": event.y,
+            "start_x": self.monitor_data[widget]["x"],
+            "start_y": self.monitor_data[widget]["y"],
+        }
+
+    def on_drag_move(self, widget, event):
+        if self.drag_data["widget"] != widget:
+            return
+
+        layout_coords = widget.translate_coordinates(self, 0, 0)
+        if layout_coords is None:
+            return
+        widget_x, widget_y = layout_coords
+
+        x = int(widget_x + event.x - self.drag_data["dx"])
+        y = int(widget_y + event.y - self.drag_data["dy"])
+
+        width = self.monitor_data[widget]["width"]
+        height = self.monitor_data[widget]["height"]
+
+        # Clamp to layout area
+        layout_width, layout_height = self.get_allocated_width(), self.get_allocated_height()
+        x = max(0, min(x, layout_width - width))
+        y = max(0, min(y, layout_height - height))
+
+        self.move(widget, x, y)
+        self.monitor_data[widget]["x"] = x
+        self.monitor_data[widget]["y"] = y
+
+
+    def on_drag_end(self, widget, event):
+        info = self.monitor_data[widget]
+        name = info["name"]
+        x = info["x"]
+        y = info["y"]
+        w = info["width"]
+        h = info["height"]
+
+        # Snap to other shapes' edges on release
+        rects = [
+            (data["x"], data["y"], data["width"], data["height"])
+            for wgt, data in self.monitor_data.items()
+            if wgt != widget
+        ]
+        x_snapped, y_snapped = snap_to_edges(x, y, rects, w, h)
+
+        self.move(widget, x_snapped, y_snapped)
+        self.monitor_data[widget]["x"] = x_snapped
+        self.monitor_data[widget]["y"] = y_snapped
+
+        self.show_overlay(name, w, h, x_snapped, y_snapped)
+
+        self.drag_data = {"widget": None, "dx": 0, "dy": 0}
+
+
+
+    def on_shape_clicked(self, widget, event, name):
+        if self.name_to_tab_index and name in self.name_to_tab_index:
+            self.notebook.set_current_page(self.name_to_tab_index[name])
+
+    def show_overlay(self, name, width, height, x, y):
+        # Create a transparent overlay window
+        win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        win.set_decorated(False)
+        win.set_accept_focus(False)
+        win.set_keep_above(True)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        win.set_app_paintable(True)
+        win.set_opacity(0.85)
+
+        # Add label
+        label = Gtk.Label(label=f"{name}\n{width}x{height}")
+        label.set_justify(Gtk.Justification.CENTER)
+        label.set_margin_top(10)
+        label.set_margin_bottom(10)
+        label.set_margin_start(10)
+        label.set_margin_end(10)
+
+        # Apply styling
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+        frame.add(label)
+        win.add(frame)
+        win.show_all()
+
+        # Move the window to the center of the monitor (best guess)
+        win.set_size_request(200, 80)
+        win.move(x + width // 2 - 100, y + height // 2 - 40)
+
+        # Auto-close after 2 seconds
+        GLib.timeout_add(2000, win.destroy)
+
+
+
+    def _remove_overlay(self, overlay):
+        if overlay.get_parent():
+            self.remove(overlay)
+        return False
+
+    def get_positions(self):
+        return {
+            data["name"]: (data["x"], data["y"])
+            for widget, data in self.monitor_data.items()
+        }
+
+
+class WayDisplaysApp(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="Way Displays GUI")
+        self.set_default_size(1280, 720)
+
+        settings = Gtk.Settings.get_default()
+        settings.set_property("gtk-theme-name", "adw-gtk3-dark")
+        settings.set_property("gtk-application-prefer-dark-theme", True)
+
+        self.monitors_notebook = Gtk.Notebook()
+        self.monitor_widgets = []  # Store widgets for later access if needed
+        self.monitor_tabs = {}
+        self.monitor_tab_indices = {}
+
+        # --- Bottom Bar ---
+        bottom_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        bottom_bar.set_margin_top(6)
+        bottom_bar.set_margin_bottom(6)
+        bottom_bar.set_margin_start(12)
+        bottom_bar.set_margin_end(12)
+
+        auto_scale_label = Gtk.Label(label="Global Auto Scale (This setting is ignored if per-monitor scaling is set.)")
+        auto_scale_label.set_halign(Gtk.Align.START)
+
+        self.auto_scale_switch = Gtk.Switch()
+        self.auto_scale_switch.set_active(True)
+
+        # Pack into the bar
+        bottom_bar.pack_start(self.auto_scale_switch, False, False, 0)
+        bottom_bar.pack_start(auto_scale_label, False, False, 0)
+
+        save_btn = Gtk.Button(label="Apply")
+        save_btn.connect("clicked", self.save_config)
+        bottom_bar.pack_end(save_btn, False, False, 0)
+
+        # --- Monitor Notebook ---
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_size_request(-1, 500)  # -1 = default width, 500px tall
+        scroll.add(self.monitors_notebook)
+
+        # --- Monitor Arrangement Frame ---
+        self.layout_area = None
+        self.layout_frame = Gtk.Frame(label="Monitor Arrangement")
+        self.layout_frame.set_size_request(1000, 600)
+
+        # Optional: add placeholder label for spacing if no layout yet
+        placeholder = Gtk.Label(label="")
+        self.layout_frame.add(placeholder)
+
+        # --- Main Layout ---
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        main_box.pack_start(self.layout_frame, False, False, 10)  # Always include layout_frame
+        main_box.pack_start(scroll, True, True, 0)
+        main_box.pack_end(bottom_bar, False, False, 0)
+
+        self.main_area = main_box
+        self.add(main_box)
+
+        # --- Load monitors ---
+        self.load_monitor_data()
+        self.reload_layout()
+        self.show_all()
+
+    def load_monitor_data(self):
+        try:
+            output = subprocess.check_output(
+                ["way-displays", "--yaml", "--get"],
+                timeout=3
+            ).decode()
+            data = yaml.safe_load(output)
+            cfg = data.get("CFG", {})
+            global_auto_scale = cfg.get("AUTO_SCALE", True)
+            self.auto_scale_switch.set_active(global_auto_scale)
+
+            # Runtime monitor info
+            state_monitors = data.get("STATE", {}).get("HEADS", [])
+            state_by_name = {mon["NAME"]: mon for mon in state_monitors}
+
+            # Load static config names from ~/.config/way-displays/cfg.yaml
+            cfg_names = set()
+            cfg_data = {}  # ensure it's always defined
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r") as f:
+                    cfg_data = yaml.safe_load(f) or {}
+                    for section in ["MODE", "SCALE", "VRR_OFF", "DISABLED"]:
+                        for entry in cfg_data.get(section, []):
+                            if isinstance(entry, dict):
+                                name = entry.get("NAME") or entry.get("NAME_DESC")
+                            else:
+                                name = entry
+                            if name:
+                                cfg_names.add(name)
+
+            # Combine names: ORDER first, then everything else
+            order = cfg.get("ORDER", [])
+            all_names = list(dict.fromkeys(order + list(cfg_names) + list(state_by_name.keys())))
+
+            # Build full monitor objects
+            full_monitors = []
+            for name in all_names:
+                mon = state_by_name.get(name)
+                if not mon:
+                    # synthesize config-only entry
+                    mon = {
+                        "NAME": name,
+                        "CURRENT": {
+                            "ENABLED": False,
+                            "MODE": {
+                                "WIDTH": 1920,
+                                "HEIGHT": 1080,
+                                "REFRESH_MHZ": 60000,
+                            },
+                            "VRR": False,
+                            "SCALE": 1.0,
+                        },
+                        "MODES": []
+                    }
+
+                # Apply any static TRANSFORM from config
+                transform_list = cfg_data.get("TRANSFORM", [])
+                if isinstance(transform_list, list):
+                    for entry in transform_list:
+                        if isinstance(entry, dict):
+                            tname = entry.get("NAME") or entry.get("NAME_DESC")
+                            if tname == name:
+                                mon.setdefault("OVERRIDES", {})["TRANSFORM"] = entry.get("TRANSFORM")
+
+                # Fall back to default transform
+                if "CURRENT" in mon and "TRANSFORM" not in mon["CURRENT"]:
+                    mon["CURRENT"]["TRANSFORM"] = "NORMAL"
+
+                full_monitors.append(mon)
+
+            # --- Build UI ---
+            self.monitor_widgets.clear()
+            self.monitor_tabs.clear()
+            self.monitor_tab_indices = {}
+
+            for idx, mon in enumerate(full_monitors):
+                widget = MonitorWidget(
+                    mon,
+                    on_enabled_toggle=self.on_monitor_enabled_toggled,
+                    on_transform_change=self.on_transform_change,
+                    on_resolution_change=self.on_resolution_change,
+                )
+                widget.app = self
+                self.monitor_widgets.append(widget)
+
+                label_text = mon.get("NAME", "Unknown")
+                if not mon.get("CURRENT", {}).get("ENABLED", True):
+                    label_text += " (Disabled)"
+                label = Gtk.Label(label=label_text)
+
+                self.monitors_notebook.append_page(widget, label)
+                self.monitor_tabs[mon["NAME"]] = (widget, label)
+                self.monitor_tab_indices[mon["NAME"]] = idx
+
+            # Layout only enabled monitors
+            enabled_monitors = [m for m in full_monitors if m.get("CURRENT", {}).get("ENABLED", True)]
+            align_setting = cfg.get("ALIGN", "TOP")
+            arrange = cfg.get("ARRANGE", "ROW")
+            self.layout_area = MonitorLayout(
+                enabled_monitors,
+                self.monitors_notebook,
+                self.monitor_tab_indices,
+                align=align_setting,
+                arrange=arrange
+            )
+
+            # Apply transforms to layout
+            for mon in enabled_monitors:
+                name = mon["NAME"]
+                widget = self.monitor_tabs.get(name, (None,))[0]
+                if widget:
+                    transform = widget.get_transform()
+                    self.on_transform_change(name, transform)
+
+        except subprocess.CalledProcessError as e:
+            print("Failed to run way-displays:", e)
+        except subprocess.TimeoutExpired:
+            print("Timeout while waiting for way-displays response.")
+
+    def _get_refresh_for_resolution(self, name, width, height):
+        for widget in self.monitor_widgets:
+            if widget.monitor.get("NAME") == name:
+                for mode in widget.monitor.get("MODES", []):
+                    if mode.get("WIDTH") == width and mode.get("HEIGHT") == height:
+                        return mode.get("REFRESH_MHZ", 60000)
+        return 60000
+
+    def on_resolution_change(self, name, width, height, refresh):
+        if not self.layout_area:
+            return
+
+        scale = 0.08
+        widget = self.layout_area.get_widget_by_name(name)
+        if not widget:
+            return
+
+        for w, data in self.layout_area.monitor_data.items():
+            if data["name"] == name:
+                data["width"] = int(width * scale)
+                data["height"] = int(height * scale)
+                data["refresh"] = refresh
+                self.layout_area._apply_transform_to_shape(w, data.get("transform"))
+
+                # --- Update the label immediately ---
+                frame = w.get_child()  # Gtk.Frame
+                box = frame.get_child()  # Gtk.Box
+                label = box.get_children()[0]  # Gtk.Label
+                label.set_text(f"{name}\n{width}x{height} @ {refresh:.2f}Hz")
+                break
+
+
+    def on_transform_change(self, name, new_transform):
+        if not self.layout_area:
+            return
+
+        widget = self.layout_area.get_widget_by_name(name)
+        if not widget:
+            return
+
+        self.layout_area.update_widget_transform(widget, new_transform)
+
+        # 🔥 NEW: Update width/height in layout metadata
+        for w, data in self.layout_area.monitor_data.items():
+            if data["name"] == name:
+                current_w = data["width"]
+                current_h = data["height"]
+
+                if new_transform and ("90" in new_transform or "270" in new_transform):
+                    data["width"], data["height"] = current_h, current_w
+                else:
+                    # fallback: use current tab to re-fetch base mode dimensions
+                    tab_widget = self.monitor_tabs.get(name, (None,))[0]
+                    if tab_widget:
+                        state = tab_widget.get_desired_state()
+                        scale = 0.08
+                        if state:
+                            data["width"] = int(state["width"] * scale)
+                            data["height"] = int(state["height"] * scale)
+
+                break
+
+        # 🔁 Force update of shape size
+        self.layout_area._apply_transform_to_shape(widget, new_transform)
+
+
+    def on_monitor_enabled_toggled(self, widget):
+        mon_name = widget.monitor.get("NAME", "Unknown")
+        enabled = widget.enable_switch.get_active()
+
+        # Update tab label
+        _, label = self.monitor_tabs.get(mon_name, (None, None))
+        if label:
+            base_text = mon_name
+            label.set_text(base_text if enabled else f"{base_text} (Disabled)")
+
+        # Update layout area
+        if not self.layout_area:
+            return
+
+        if enabled:
+            # Add to layout
+            self.layout_area.add_monitor(widget.monitor)
+        else:
+            # Remove from layout
+            self.layout_area.remove_monitor(mon_name)
+
+    def save_config(self, button=None):
+        # --- Load existing config YAML ---
+        cfg = {}
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+
+        # Ensure sections exist
+        cfg.setdefault("MODE", [])
+        cfg.setdefault("SCALE", [])
+        cfg.setdefault("VRR_OFF", [])
+        cfg.setdefault("DISABLED", [])
+        cfg.setdefault("TRANSFORM", [])
+
+        # Helper to update (or add) entry in a list of dicts
+        def upsert_entry(lst, name_key, name_value, key, value):
+            found = False
+            for entry in lst:
+                if isinstance(entry, dict) and (entry.get("NAME") == name_value or entry.get("NAME_DESC") == name_value):
+                    entry[key] = value
+                    found = True
+                    break
+            if not found:
+                lst.append({name_key: name_value, key: value})
+
+        # --- Apply monitor states ---
+        for widget in self.monitor_widgets:
+            if isinstance(widget, MonitorWidget):
+                state = widget.get_desired_state()
+                if state is None:
+                    continue
+
+                name = state["name"]
+                w = str(state["width"])
+                h = str(state["height"])
+                hz = str(state["refresh"] // 1000)
+                enabled = state["enabled"]
+                vrr = state["vrr"]
+                scale = state["scale"]
+                transform = state.get("transform")
+
+                # MODE
+                upsert_entry(cfg["MODE"], "NAME_DESC", name, "WIDTH", int(w))
+                upsert_entry(cfg["MODE"], "NAME_DESC", name, "HEIGHT", int(h))
+                upsert_entry(cfg["MODE"], "NAME_DESC", name, "HZ", int(hz))
+
+                # SCALE
+                upsert_entry(cfg["SCALE"], "NAME_DESC", name, "SCALE", float(scale))
+
+                # VRR_OFF
+                if not vrr:
+                    if name not in [(entry.get("NAME") if isinstance(entry, dict) else entry) for entry in cfg["VRR_OFF"]]:
+                        cfg["VRR_OFF"].append(name)
+                else:
+                    cfg["VRR_OFF"] = [
+                        entry for entry in cfg["VRR_OFF"]
+                        if (entry.get("NAME") if isinstance(entry, dict) else entry) != name
+                    ]
+
+                # DISABLED
+                if not enabled:
+                    if name not in [(entry.get("NAME") if isinstance(entry, dict) else entry) for entry in cfg["DISABLED"]]:
+                        cfg["DISABLED"].append(name)
+                else:
+                    cfg["DISABLED"] = [
+                        entry for entry in cfg["DISABLED"]
+                        if (entry.get("NAME") if isinstance(entry, dict) else entry) != name
+                    ]
+
+                # TRANSFORM
+                if transform:
+                    upsert_entry(cfg["TRANSFORM"], "NAME_DESC", name, "TRANSFORM", transform)
+                    subprocess.run(["way-displays", "--set", "TRANSFORM", name, transform])
+                else:
+                    cfg["TRANSFORM"] = [
+                        entry for entry in cfg["TRANSFORM"]
+                        if isinstance(entry, dict) and entry.get("NAME") != name and entry.get("NAME_DESC") != name
+                    ]
+                    subprocess.run(["way-displays", "--delete", "TRANSFORM", name])
+
+                # Apply other way-displays settings
+                subprocess.run(["way-displays", "--set", "MODE", name, w, h, hz])
+                subprocess.run(["way-displays", "--set", "SCALE", name, f"{scale:.2f}"])
+                if not vrr:
+                    subprocess.run(["way-displays", "--set", "VRR_OFF", name])
+                else:
+                    subprocess.run(["way-displays", "--delete", "VRR_OFF", name])
+                if not enabled:
+                    subprocess.run(["way-displays", "--set", "DISABLED", name])
+                else:
+                    subprocess.run(["way-displays", "--delete", "DISABLED", name])
+
+        # --- Save arrangement + alignment ---
+        if self.layout_area:
+            positions = {}
+            transform_map = {
+                meta["name"]: meta.get("transform", "0")
+                for meta in self.layout_area.monitor_data.values()
+            }
+            for eventbox, meta in self.layout_area.monitor_data.items():
+                positions[meta["name"]] = {
+                    "x": meta["x"],
+                    "y": meta["y"],
+                    "w": meta["width"],
+                    "h": meta["height"],
+                }
+
+            # Sort left-to-right (for row) or top-to-bottom (for column)
+            xs = [meta["x"] for meta in positions.values()]
+            ys = [meta["y"] for meta in positions.values()]
+            auto_arrange = "ROW" if (max(xs) - min(xs)) >= (max(ys) - min(ys)) else "COLUMN"
+            # Determine ALIGN if ROW
+            if auto_arrange == "ROW" and len(positions) >= 2:
+                sorted_items = sorted(positions.items(), key=lambda item: item[1]["x"])
+                main_name, main_meta = sorted_items[0]
+                neighbor_name, neighbor_meta = sorted_items[1]
+
+                transform_main = transform_map.get(main_name, "0")
+                transform_neighbor = transform_map.get(neighbor_name, "0")
+
+                # Get rotated dimensions
+                main_w, main_h = rotated_dimensions(main_meta["w"], main_meta["h"], transform_main)
+                neighbor_w, neighbor_h = rotated_dimensions(neighbor_meta["w"], neighbor_meta["h"], transform_neighbor)
+
+                # Top, middle, bottom based on y coords
+                main_top = main_meta["y"]
+                main_bottom = main_top + main_h
+                main_center = main_top + main_h / 2
+
+                neighbor_top = neighbor_meta["y"]
+                neighbor_bottom = neighbor_top + neighbor_h
+                neighbor_center = neighbor_top + neighbor_h / 2
+
+                top_diff = abs(neighbor_top - main_top)
+                mid_diff = abs(neighbor_center - main_center)
+                bottom_diff = abs(neighbor_bottom - main_bottom)
+
+                min_diff = min(top_diff, mid_diff, bottom_diff)
+                SNAP_TOLERANCE = 100
+
+                if min_diff == mid_diff and mid_diff < SNAP_TOLERANCE:
+                    cfg["ALIGN"] = "MIDDLE"
+                elif min_diff == bottom_diff and bottom_diff < SNAP_TOLERANCE:
+                    cfg["ALIGN"] = "BOTTOM"
+                else:
+                    cfg["ALIGN"] = "TOP"
+            elif auto_arrange == "COLUMN" and len(positions) >= 2:
+                sorted_items = sorted(positions.items(), key=lambda item: item[1]["y"])
+                main_name, main_meta = sorted_items[0]
+                neighbor_name, neighbor_meta = sorted_items[1]
+
+                transform_main = transform_map.get(main_name, "0")
+                transform_neighbor = transform_map.get(neighbor_name, "0")
+
+                # Get rotated dimensions
+                main_w, main_h = rotated_dimensions(main_meta["w"], main_meta["h"], transform_main)
+                neighbor_w, neighbor_h = rotated_dimensions(neighbor_meta["w"], neighbor_meta["h"], transform_neighbor)
+
+                # Left, middle, right based on x coords
+                main_left = main_meta["x"]
+                main_right = main_left + main_w
+                main_center = main_left + main_w / 2
+
+                neighbor_left = neighbor_meta["x"]
+                neighbor_right = neighbor_left + neighbor_w
+                neighbor_center = neighbor_left + neighbor_w / 2
+
+                left_diff = abs(neighbor_left - main_left)
+                mid_diff = abs(neighbor_center - main_center)
+                right_diff = abs(neighbor_right - main_right)
+
+                min_diff = min(left_diff, mid_diff, right_diff)
+                SNAP_TOLERANCE = 25
+
+                if min_diff == mid_diff and mid_diff < SNAP_TOLERANCE:
+                    cfg["ALIGN"] = "MIDDLE"
+                elif min_diff == right_diff and right_diff < SNAP_TOLERANCE:
+                    cfg["ALIGN"] = "RIGHT"
+                else:
+                    cfg["ALIGN"] = "LEFT"
+
+
+            sorted_names = (
+                sorted(positions.keys(), key=lambda n: positions[n]["x"])
+                if auto_arrange == "ROW"
+                else sorted(positions.keys(), key=lambda n: positions[n]["y"])
+            )
+            cfg["ORDER"] = sorted_names
+
+            # Use snapped value if available
+            cfg["ARRANGE"] = auto_arrange
+
+            self.arrange_mode = cfg["ARRANGE"]
+
+            # Alignment
+            default_align = "TOP" if auto_arrange == "ROW" else "LEFT"
+
+        # --- Global AutoScale ---
+        global_auto = self.auto_scale_switch.get_active()
+        subprocess.run([
+            "way-displays", "--set", "AUTO_SCALE",
+            "true" if global_auto else "false"
+        ])
+
+        subprocess.run(["way-displays", "--set", "ARRANGE_ALIGN", cfg["ARRANGE"], cfg["ALIGN"]])
+
+        # --- Write back YAML ---
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+
+        subprocess.run(["way-displays", "--write"])
+        GLib.timeout_add(250, self.reload_layout)
+
+    def load_monitor_state(self):
+        if not os.path.exists(CONFIG_PATH):
+            print(f"Config file not found: {CONFIG_PATH}")
+            return {}
+
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                return yaml.safe_load(f) or {}
+
+        except yaml.YAMLError as e:
+            print("Failed to parse YAML config:")
+            return {}
+
+
+    def reload_layout(self):
+        # Load updated config values
+        with open(CONFIG_PATH, "r") as f:
+            cfg = yaml.safe_load(f)
+
+        arrange = cfg.get("ARRANGE", "ROW")
+        align = cfg.get("ALIGN", "TOP")
+        order = cfg.get("ORDER", [])
+        transform_overrides = {
+            (entry.get("NAME_DESC") or entry.get("NAME")): entry.get("TRANSFORM")
+            for entry in cfg.get("TRANSFORM", [])
+        }
+        # --- Remove old contents from the layout frame ---
+        for child in self.layout_frame.get_children():
+            self.layout_frame.remove(child)
+
+        # --- Update monitor dicts with fresh TRANSFORM ---
+        name_to_tab_index = {w.monitor["NAME"]: i for i, w in enumerate(self.monitor_widgets)}
+        monitors_dicts = []
+
+        for widget in self.monitor_widgets:
+            monitor = widget.monitor.copy()
+            monitors_dicts.append(monitor)
+
+        # --- Create new layout ---
+        self.layout_area = MonitorLayout(
+            monitors=monitors_dicts,
+            notebook=self.monitors_notebook,
+            name_to_tab_index=name_to_tab_index,
+            align=align,
+            arrange=arrange,
+            order=order,
+            transform_overrides=transform_overrides,
+        )
+
+        self.layout_frame.add(self.layout_area)
+        self.layout_frame.show_all()
+
+
+
+
+
+
+
+
+
+if __name__ == '__main__':
+    app = WayDisplaysApp()
+    app.connect("destroy", Gtk.main_quit)
+    Gtk.main()
