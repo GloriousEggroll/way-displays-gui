@@ -2,6 +2,7 @@
 
 import gi
 import os
+import socket
 import subprocess
 import yaml
 
@@ -13,6 +14,9 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GObject, GLib
 
 CONFIG_PATH = os.path.expandvars("$HOME/.config/way-displays/cfg.yaml")
+
+SOCKET_PATH = os.path.expandvars("$XDG_RUNTIME_DIR/way-displays.$XDG_VTNR.sock")
+SOCKET_CHUNK_LEN = 8192
 
 class MonitorOverlay(Gtk.Window):
     def __init__(self, name, width, height, refresh, x, y):
@@ -309,6 +313,28 @@ class MonitorWidget(Gtk.Box):
             "transform": self.get_transform(),  # <--- add transform here
         }
 
+# send a UNIX socket IPC operation request and return the response as utf-8 string
+# ref: https://docs.python.org/3/howto/sockets.html#socket-howto
+def ipc_operation(operation):
+    raw = b''
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+
+            # attempt to connect to the socket
+            client.connect(SOCKET_PATH)
+            client.send(f"OP: {operation}".encode("utf-8"))
+
+            # read responses until the server is done
+            chunk = None
+            while chunk != b'':
+                chunk = client.recv(SOCKET_CHUNK_LEN);
+                raw += chunk
+
+        except FileNotFoundError:
+            print(f"way-displays socket {SOCKET_PATH} not found. Is the server running? Are $WAYLAND_DISPLAY and $XDG_VTNR set?")
+
+    return raw.decode("utf-8")
 
 def snap_to_edges(x, y, rects, width, height, margin=0):
     snap_threshold = 30
@@ -1182,10 +1208,7 @@ class WayDisplaysApp(Gtk.Window):
 
     def load_monitor_data(self):
         try:
-            output = subprocess.check_output(
-                ["way-displays", "--yaml", "--get"],
-                timeout=3
-            ).decode()
+            output = ipc_operation("GET")
             data = yaml.safe_load(output)
             cfg = data.get("CFG", {})
             global_auto_scale = cfg.get("AUTO_SCALE", True)
@@ -1616,7 +1639,8 @@ class WayDisplaysApp(Gtk.Window):
         with open(CONFIG_PATH, "w") as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
 
-        subprocess.run(["way-displays", "--write"])
+        ipc_operation("CFG_WRITE")
+
         GLib.timeout_add(250, self.reload_layout)
 
     def load_monitor_state(self):
