@@ -1099,6 +1099,44 @@ class WayDisplaysApp(Gtk.Window):
         bottom_bar.set_margin_start(12)
         bottom_bar.set_margin_end(12)
 
+        # --- Notification Bar ---
+        notif_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        notif_bar.set_margin_top(6)
+        notif_bar.set_margin_bottom(6)
+        notif_bar.set_margin_start(12)
+        notif_bar.set_margin_end(12)
+
+        self.notify_toggle = Gtk.Switch()
+        self.notify_toggle.set_halign(Gtk.Align.END)
+        self.notify_toggle.connect("notify::active", self.on_notify_toggle)
+        notif_bar.pack_start(self.notify_toggle, False, False, 0)
+        notif_bar.pack_start(Gtk.Label(label="Enable Notifications"), False, False, 0)
+
+        notif_label = Gtk.Label(label="Notification App:")
+        notif_label.set_halign(Gtk.Align.START)
+        notif_bar.pack_start(notif_label, False, False, 0)
+
+        self.callback_entry = Gtk.Entry()
+        self.callback_entry.set_hexpand(True)
+        notif_bar.pack_start(self.callback_entry, True, True, 0)
+
+        # Load CALLBACK_CMD from config (or fallback)
+        callback_cmd = ""
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r") as f:
+                cfg = yaml.safe_load(f)
+                callback_cmd = cfg.get("CALLBACK_CMD", "")
+
+        default_cb = 'notify-send "way-displays ${CALLBACK_LEVEL}" "${CALLBACK_MSG}"'
+
+        if callback_cmd and callback_cmd.strip():
+            self.callback_entry.set_text(callback_cmd)
+            self.notify_toggle.set_active(True)
+        else:
+            self.callback_entry.set_text(default_cb)
+            self.notify_toggle.set_active(False)
+
+
         auto_scale_label = Gtk.Label(label="Global Auto Scale (This setting is ignored if per-monitor scaling is set.)")
         auto_scale_label.set_halign(Gtk.Align.START)
 
@@ -1131,6 +1169,7 @@ class WayDisplaysApp(Gtk.Window):
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         main_box.pack_start(self.layout_frame, False, False, 10)  # Always include layout_frame
         main_box.pack_start(scroll, True, True, 0)
+        main_box.pack_start(notif_bar, False, False, 0)
         main_box.pack_end(bottom_bar, False, False, 0)
 
         self.main_area = main_box
@@ -1260,6 +1299,17 @@ class WayDisplaysApp(Gtk.Window):
         except subprocess.TimeoutExpired:
             print("Timeout while waiting for way-displays response.")
 
+    def on_notify_toggle(self, switch, _param):
+        enabled = switch.get_active()
+        default_cmd = 'notify-send "way-displays ${CALLBACK_LEVEL}" "${CALLBACK_MSG}"'
+        current = self.callback_entry.get_text().strip()
+
+        if enabled:
+            if not current:
+                self.callback_entry.set_text(default_cmd)
+        else:
+            self.callback_entry.set_text("")
+
     def _get_refresh_for_resolution(self, name, width, height):
         for widget in self.monitor_widgets:
             if widget.monitor.get("NAME") == name:
@@ -1379,6 +1429,10 @@ class WayDisplaysApp(Gtk.Window):
                 if state is None:
                     continue
 
+                # Save CALLBACK_CMD
+                callback_value = self.callback_entry.get_text().strip() if self.notify_toggle.get_active() else ""
+                cfg["CALLBACK_CMD"] = callback_value
+
                 name = state["name"]
                 w = str(state["width"])
                 h = str(state["height"])
@@ -1426,6 +1480,10 @@ class WayDisplaysApp(Gtk.Window):
                         if isinstance(entry, dict) and entry.get("NAME") != name and entry.get("NAME_DESC") != name
                     ]
                     subprocess.run(["way-displays", "--delete", "TRANSFORM", name])
+
+                # CALLBACK NOTIFICATIONS COMMAAND
+                if callback_value:
+                    subprocess.run(["way-displays", "--set", "CALLBACK_CMD", callback_value])
 
                 # Apply other way-displays settings
                 subprocess.run(["way-displays", "--set", "MODE", name, w, h, hz])
