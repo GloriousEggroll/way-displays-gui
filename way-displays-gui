@@ -47,7 +47,7 @@ class MonitorWidget(Gtk.Box):
         self.set_margin_bottom(12)
         self._on_transform_change = on_transform_change
         self.flip_switch = None
-        name = monitor.get('NAME', 'Unknown')
+        name = monitor.get('DESCRIPTION', 'Unknown')
         make = monitor.get('MAKE', '')
         model = monitor.get('MODEL', '')
         self.pack_start(Gtk.Label(label=f"{name} ({make} {model})"), False, False, 0)
@@ -187,7 +187,7 @@ class MonitorWidget(Gtk.Box):
         self.pack_start(self.scale_slider, False, False, 0)
 
         if self._on_transform_change:
-            self._on_transform_change(self.monitor.get("NAME"), self.get_transform())
+            self._on_transform_change(self.monitor.get("DESCRIPTION"), self.get_transform())
 
         self.res_combo.connect("changed", self.on_resolution_changed)
 
@@ -221,7 +221,7 @@ class MonitorWidget(Gtk.Box):
         if self._on_resolution_change:
             # Pass name + numeric values
             self._on_resolution_change(
-                self.monitor["NAME"],
+                self.monitor["DESCRIPTION"],
                 width,
                 height,
                 refresh_hz
@@ -254,13 +254,10 @@ class MonitorWidget(Gtk.Box):
 
     def on_flip_toggled(self, switch, _param):
         if self._on_transform_change:
-            self._on_transform_change(self.monitor.get("NAME"), self.get_transform())
+            self._on_transform_change(self.monitor.get("DESCRIPTION"), self.get_transform())
 
     def _on_enabled_toggled(self, switch, gparam):
         enabled = switch.get_active()
-
-        # Add this to debug:
-        print(f"[WIDGET] Setting {self.monitor['NAME']} ENABLED = {enabled}")
 
         if "CURRENT" not in self.monitor:
             self.monitor["CURRENT"] = {}
@@ -284,7 +281,7 @@ class MonitorWidget(Gtk.Box):
 
         # Apply the transform immediately
         if self._on_transform_change:
-            self._on_transform_change(self.monitor.get("NAME"), self.get_transform())
+            self._on_transform_change(self.monitor.get("DESCRIPTION"), self.get_transform())
 
     def on_scale_value_changed(self, scale):
         value = scale.get_value()
@@ -319,7 +316,7 @@ class MonitorWidget(Gtk.Box):
             return None
 
         selected_mode = self.monitor["MODES"][selected_index]
-        name = self.monitor["NAME"]
+        name = self.monitor["DESCRIPTION"]
 
         return {
             "name": name,
@@ -415,7 +412,7 @@ class MonitorLayout(Gtk.Layout):
         self._current_order = order
 
         # Filter monitors in ORDER, then append any missing ones
-        monitor_map = {m["NAME"]: m for m in monitors}  # include all
+        monitor_map = {m["DESCRIPTION"]: m for m in monitors}  # include all
         ordered_monitors = []
         seen_names = set()
 
@@ -442,7 +439,7 @@ class MonitorLayout(Gtk.Layout):
         scale = 0.08
         monitor_widgets = []
         for mon in ordered_monitors:
-            name = mon["NAME"]
+            name = mon["DESCRIPTION"]
             mode = mon.get("CURRENT", {}).get("MODE", {})
             width = mode.get("WIDTH", 1920)
             height = mode.get("HEIGHT", 1080)
@@ -795,7 +792,7 @@ class MonitorLayout(Gtk.Layout):
 
 
     def add_monitor(self, monitor):
-        name = monitor["NAME"]
+        name = monitor["DESCRIPTION"]
 
         for child in self.get_children():
             child_data = self.monitor_data.get(child)
@@ -1260,26 +1257,12 @@ class WayDisplaysApp(Gtk.Window):
 
             # Runtime monitor info
             state_monitors = data.get("STATE", {}).get("HEADS", [])
-            state_by_name = {mon["NAME"]: mon for mon in state_monitors}
+            state_by_name = {mon["DESCRIPTION"]: mon for mon in state_monitors}
 
-            # Load static config names from ~/.config/way-displays/cfg.yaml
-            cfg_names = set()
-            cfg_data = {}  # ensure it's always defined
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r") as f:
-                    cfg_data = yaml.safe_load(f) or {}
-                    for section in ["MODE", "SCALE", "VRR_OFF", "DISABLED"]:
-                        for entry in cfg_data.get(section, []):
-                            if isinstance(entry, dict):
-                                name = entry.get("NAME") or entry.get("NAME_DESC")
-                            else:
-                                name = entry
-                            if name:
-                                cfg_names.add(name)
-
-            # Combine names: ORDER first, then everything else
-            order = cfg.get("ORDER", [])
-            all_names = list(dict.fromkeys(order + list(cfg_names) + list(state_by_name.keys())))
+            # Combine names:
+            all_names = list(dict.fromkeys(list(state_by_name.keys())))
+            all_names = [n for n in all_names]
+            print("Final tab list:", all_names)
 
             # Build full monitor objects
             full_monitors = []
@@ -1288,7 +1271,7 @@ class WayDisplaysApp(Gtk.Window):
                 if not mon:
                     # synthesize config-only entry
                     mon = {
-                        "NAME": name,
+                        "DESCRIPTION": name,
                         "CURRENT": {
                             "ENABLED": False,
                             "MODE": {
@@ -1303,11 +1286,11 @@ class WayDisplaysApp(Gtk.Window):
                     }
 
                 # Apply any static TRANSFORM from config
-                transform_list = cfg_data.get("TRANSFORM", [])
+                transform_list = cfg.get("TRANSFORM", [])
                 if isinstance(transform_list, list):
                     for entry in transform_list:
                         if isinstance(entry, dict):
-                            tname = entry.get("NAME") or entry.get("NAME_DESC")
+                            tname = entry.get("DESCRIPTION")
                             if tname == name:
                                 mon.setdefault("OVERRIDES", {})["TRANSFORM"] = entry.get("TRANSFORM")
 
@@ -1318,9 +1301,12 @@ class WayDisplaysApp(Gtk.Window):
                 full_monitors.append(mon)
 
             # --- Build UI ---
+            while self.monitors_notebook.get_n_pages() > 0:
+                self.monitors_notebook.remove_page(-1)
+
             self.monitor_widgets.clear()
             self.monitor_tabs.clear()
-            self.monitor_tab_indices = {}
+            self.monitor_tab_indices.clear()
 
             for idx, mon in enumerate(full_monitors):
                 widget = MonitorWidget(
@@ -1332,14 +1318,14 @@ class WayDisplaysApp(Gtk.Window):
                 widget.app = self
                 self.monitor_widgets.append(widget)
 
-                label_text = mon.get("NAME", "Unknown")
+                label_text = mon.get("DESCRIPTION", "Unknown")
                 if not mon.get("CURRENT", {}).get("ENABLED", True):
                     label_text += " (Disabled)"
                 label = Gtk.Label(label=label_text)
 
                 self.monitors_notebook.append_page(widget, label)
-                self.monitor_tabs[mon["NAME"]] = (widget, label)
-                self.monitor_tab_indices[mon["NAME"]] = idx
+                self.monitor_tabs[mon["DESCRIPTION"]] = (widget, label)
+                self.monitor_tab_indices[mon["DESCRIPTION"]] = idx
 
             # Layout only enabled monitors
             enabled_monitors = [m for m in full_monitors if m.get("CURRENT", {}).get("ENABLED", True)]
@@ -1355,7 +1341,7 @@ class WayDisplaysApp(Gtk.Window):
 
             # Apply transforms to layout
             for mon in enabled_monitors:
-                name = mon["NAME"]
+                name = mon["DESCRIPTION"]
                 widget = self.monitor_tabs.get(name, (None,))[0]
                 if widget:
                     transform = widget.get_transform()
@@ -1379,7 +1365,7 @@ class WayDisplaysApp(Gtk.Window):
 
     def _get_refresh_for_resolution(self, name, width, height):
         for widget in self.monitor_widgets:
-            if widget.monitor.get("NAME") == name:
+            if widget.monitor.get("DESCRIPTION") == name:
                 for mode in widget.monitor.get("MODES", []):
                     if mode.get("WIDTH") == width and mode.get("HEIGHT") == height:
                         return mode.get("REFRESH_MHZ", 60000)
@@ -1444,8 +1430,8 @@ class WayDisplaysApp(Gtk.Window):
 
 
     def on_monitor_enabled_toggled(self, monitor, enabled):
-        print(f"[TOGGLE] {monitor['NAME']} -> {'ENABLED' if enabled else 'DISABLED'}")
-        name = monitor.get("NAME", "Unknown")
+        print(f"[TOGGLE] {monitor['DESCRIPTION']} -> {'ENABLED' if enabled else 'DISABLED'}")
+        name = monitor.get("DESCRIPTION", "Unknown")
 
         # Update tab label
         _, label = self.monitor_tabs.get(name, (None, None))
@@ -1480,7 +1466,7 @@ class WayDisplaysApp(Gtk.Window):
         def upsert_entry(lst, name_key, name_value, key, value):
             found = False
             for entry in lst:
-                if isinstance(entry, dict) and (entry.get("NAME") == name_value or entry.get("NAME_DESC") == name_value):
+                if isinstance(entry, dict) and (entry.get("DESCRIPTION") == name_value):
                     entry[key] = value
                     found = True
                     break
@@ -1508,41 +1494,41 @@ class WayDisplaysApp(Gtk.Window):
                 transform = state.get("transform")
 
                 # MODE
-                upsert_entry(cfg["MODE"], "NAME_DESC", name, "WIDTH", int(w))
-                upsert_entry(cfg["MODE"], "NAME_DESC", name, "HEIGHT", int(h))
-                upsert_entry(cfg["MODE"], "NAME_DESC", name, "HZ", int(hz))
+                upsert_entry(cfg["MODE"], "DESCRIPTION", name, "WIDTH", int(w))
+                upsert_entry(cfg["MODE"], "DESCRIPTION", name, "HEIGHT", int(h))
+                upsert_entry(cfg["MODE"], "DESCRIPTION", name, "HZ", int(hz))
 
                 # SCALE
-                upsert_entry(cfg["SCALE"], "NAME_DESC", name, "SCALE", float(scale))
+                upsert_entry(cfg["SCALE"], "DESCRIPTION", name, "SCALE", float(scale))
 
                 # VRR_OFF
                 if not vrr:
-                    if name not in [(entry.get("NAME") if isinstance(entry, dict) else entry) for entry in cfg["VRR_OFF"]]:
+                    if name not in [(entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) for entry in cfg["VRR_OFF"]]:
                         cfg["VRR_OFF"].append(name)
                 else:
                     cfg["VRR_OFF"] = [
                         entry for entry in cfg["VRR_OFF"]
-                        if (entry.get("NAME") if isinstance(entry, dict) else entry) != name
+                        if (entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) != name
                     ]
 
                 # DISABLED
                 if not enabled:
-                    if name not in [(entry.get("NAME") if isinstance(entry, dict) else entry) for entry in cfg["DISABLED"]]:
+                    if name not in [(entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) for entry in cfg["DISABLED"]]:
                         cfg["DISABLED"].append(name)
                 else:
                     cfg["DISABLED"] = [
                         entry for entry in cfg["DISABLED"]
-                        if (entry.get("NAME") if isinstance(entry, dict) else entry) != name
+                        if (entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) != name
                     ]
 
                 # TRANSFORM
                 if transform:
-                    upsert_entry(cfg["TRANSFORM"], "NAME_DESC", name, "TRANSFORM", transform)
+                    upsert_entry(cfg["TRANSFORM"], "DESCRIPTION", name, "TRANSFORM", transform)
                     subprocess.run(["way-displays", "--set", "TRANSFORM", name, transform])
                 else:
                     cfg["TRANSFORM"] = [
                         entry for entry in cfg["TRANSFORM"]
-                        if isinstance(entry, dict) and entry.get("NAME") != name and entry.get("NAME_DESC") != name
+                        if isinstance(entry, dict) and entry.get("DESCRIPTION") != name
                     ]
                     subprocess.run(["way-displays", "--delete", "TRANSFORM", name])
 
@@ -1657,6 +1643,7 @@ class WayDisplaysApp(Gtk.Window):
                 if auto_arrange == "ROW"
                 else sorted(positions.keys(), key=lambda n: positions[n]["y"])
             )
+            print(f"sorted names: {sorted_names}")
             cfg["ORDER"] = sorted_names
 
             # Use snapped value if available
@@ -1707,7 +1694,7 @@ class WayDisplaysApp(Gtk.Window):
         align = cfg.get("ALIGN", "TOP")
         order = cfg.get("ORDER", [])
         transform_overrides = {
-            (entry.get("NAME_DESC") or entry.get("NAME")): entry.get("TRANSFORM")
+            (entry.get("DESCRIPTION")): entry.get("TRANSFORM")
             for entry in cfg.get("TRANSFORM", [])
         }
         # --- Remove old contents from the layout frame ---
@@ -1715,7 +1702,7 @@ class WayDisplaysApp(Gtk.Window):
             self.layout_frame.remove(child)
 
         # --- Update monitor dicts with fresh TRANSFORM ---
-        name_to_tab_index = {w.monitor["NAME"]: i for i, w in enumerate(self.monitor_widgets)}
+        name_to_tab_index = {w.monitor["DESCRIPTION"]: i for i, w in enumerate(self.monitor_widgets)}
         monitors_dicts = []
 
         for widget in self.monitor_widgets:
