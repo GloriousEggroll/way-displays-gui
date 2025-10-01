@@ -194,26 +194,39 @@ class MonitorWidget(Gtk.Box):
     # ------------------ Methods ------------------
 
     def on_resolution_changed(self, combo):
-        active_text = combo.get_active_text()
-        if not active_text:
+        active_index = combo.get_active()
+        if active_index < 0:
+            return  # Nothing selected
+
+        # Get the mode object from the monitor's MODES list
+        modes = self.monitor.get('MODES', [])
+        if active_index >= len(modes):
             return
+        mode = modes[active_index]
 
-        # Parse: "3840x2160 @ 120.00Hz"
-        try:
-            res_part, hz_part = active_text.split("@")
-            width, height = map(int, res_part.strip().split("x"))
-            refresh = float(hz_part.strip().replace("Hz", ""))
-        except ValueError:
-            print(f"Failed to parse resolution string: {active_text}")
-            return
+        width = mode.get("WIDTH", 1920)
+        height = mode.get("HEIGHT", 1080)
+        refresh_mhz = mode.get("REFRESH_MHZ", 60000)  # still in mHz
+        refresh_hz = refresh_mhz / 1000.0
 
-        # Save new resolution state
-        self.monitor["WIDTH"] = width
-        self.monitor["HEIGHT"] = height
-        self.monitor["REFRESH_MHZ"] = int(refresh * 1000)
+        # --- Update monitor state ---
+        # (so the app knows what’s currently selected)
+        self.monitor["CURRENT"]["MODE"] = {
+            "WIDTH": width,
+            "HEIGHT": height,
+            "REFRESH_MHZ": refresh_mhz
+        }
 
-        # Call layout update
-        self._on_resolution_change(self.monitor["NAME"], width, height, refresh)
+        # --- Notify the main app to update config/layout ---
+        if self._on_resolution_change:
+            # Pass name + numeric values
+            self._on_resolution_change(
+                self.monitor["NAME"],
+                width,
+                height,
+                refresh_hz
+            )
+
 
     def _on_resolution_change(self, name, new_width, new_height, refresh):
         if not self.layout_area:
