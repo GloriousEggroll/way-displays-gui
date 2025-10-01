@@ -243,9 +243,19 @@ class MonitorWidget(Gtk.Box):
         if self._on_transform_change:
             self._on_transform_change(self.monitor.get("NAME"), self.get_transform())
 
-    def _on_enabled_toggled(self, switch, _param):
+    def _on_enabled_toggled(self, switch, gparam):
+        enabled = switch.get_active()
+
+        # Add this to debug:
+        print(f"[WIDGET] Setting {self.monitor['NAME']} ENABLED = {enabled}")
+
+        if "CURRENT" not in self.monitor:
+            self.monitor["CURRENT"] = {}
+        self.monitor["CURRENT"]["ENABLED"] = enabled
+
         if self._on_enabled_toggle:
-            self._on_enabled_toggle(self)
+            self._on_enabled_toggle(self.monitor, enabled)
+
 
     def on_rotation_selected(self, btn, rotation):
         # Only proceed if the clicked button was just activated
@@ -392,7 +402,7 @@ class MonitorLayout(Gtk.Layout):
         self._current_order = order
 
         # Filter monitors in ORDER, then append any missing ones
-        monitor_map = {m["NAME"]: m for m in monitors if m.get("CURRENT", {}).get("ENABLED", True)}
+        monitor_map = {m["NAME"]: m for m in monitors}  # include all
         ordered_monitors = []
         seen_names = set()
 
@@ -426,7 +436,6 @@ class MonitorLayout(Gtk.Layout):
             refresh = mode.get("REFRESH_MHZ", 60000) / 1000.0
             transform = mon.get("OVERRIDES", {}).get("TRANSFORM", 0)
 
-            # Rotate dimensions if portrait
             if str(transform) in ("90", "270"):
                 width, height = height, width
 
@@ -437,7 +446,6 @@ class MonitorLayout(Gtk.Layout):
             frame.set_shadow_type(Gtk.ShadowType.IN)
             frame.get_style_context().add_class("monitor-frame")
 
-            rotated_w, rotated_h = rotated_dimensions(width, height, transform)
             label = Gtk.Label(label=f"{name}\n{width}x{height} @ {refresh:.0f}Hz")
             label.set_justify(Gtk.Justification.CENTER)
 
@@ -460,7 +468,20 @@ class MonitorLayout(Gtk.Layout):
             eventbox.connect("button-release-event", self.on_drag_end)
             eventbox.connect("button-press-event", self.on_shape_clicked, name)
 
-            monitor_widgets.append((eventbox, name, w, h, transform))
+            # only pack enabled monitors into the layout, but still store meta
+            if mon.get("CURRENT", {}).get("ENABLED", True):
+                monitor_widgets.append((eventbox, name, w, h, transform))
+
+            # store metadata always
+            self.monitor_data[eventbox] = {
+                "name": name,
+                "width": w,
+                "height": h,
+                "x": 0,
+                "y": 0,
+                "transform": transform
+            }
+
 
         # --- Calculate layout positions ---
         padding = 0  # No gaps between
@@ -762,15 +783,26 @@ class MonitorLayout(Gtk.Layout):
 
     def add_monitor(self, monitor):
         name = monitor["NAME"]
-        if name in [data["name"] for data in self.monitor_data.values()]:
-            return  # Already added
+
+        for child in self.get_children():
+            child_data = self.monitor_data.get(child)
+            if child_data and child_data["name"] == name:
+                return  # Still visible, skip
 
         mode = monitor.get("CURRENT", {}).get("MODE", {})
         width = mode.get("WIDTH", 1920)
         height = mode.get("HEIGHT", 1080)
         refresh = mode.get("REFRESH_MHZ", 60000) / 1000.0
-        w, h = int(width * 0.10), int(height * 0.10)
+        transform = monitor.get("OVERRIDES", {}).get("TRANSFORM", 0)
 
+        # Swap width and height if rotated
+        if str(transform) in ("90", "270"):
+            width, height = height, width
+
+        scale = 0.08
+        w, h = int(width * scale), int(height * scale)
+
+        # --- Build frame ---
         frame = Gtk.Frame()
         frame.set_size_request(w, h)
         frame.set_shadow_type(Gtk.ShadowType.IN)
@@ -781,7 +813,7 @@ class MonitorLayout(Gtk.Layout):
 
         box = Gtk.Box()
         box.set_halign(Gtk.Align.FILL)
-        box.set_valign(Gtk.Align.FILL)
+        # box.set_valign(Gtk.Align.FILL)
         box.pack_start(label, True, True, 0)
         frame.add(box)
 
@@ -796,32 +828,46 @@ class MonitorLayout(Gtk.Layout):
         eventbox.connect("button-press-event", self.on_drag_start)
         eventbox.connect("motion-notify-event", self.on_drag_move)
         eventbox.connect("button-release-event", self.on_drag_end)
+        eventbox.connect("button-press-event", self.on_shape_clicked, name)
 
-        # Place it in the center
-        x = (self.get_allocated_width() - w) // 2
-        y = (self.get_allocated_height() - h) // 2
+        # Default placement in center or (100,100)
+        existing = list(self.monitor_data.values())
+        arrange = getattr(self, "_current_arrange", "ROW").upper()
+
+        if existing:
+            if arrange == "ROW":
+                max_x = max(d["x"] + d["width"] for d in existing)
+                x = max_x + 20
+                y = min(d["y"] for d in existing)
+            else:  # COLUMN
+                max_y = max(d["y"] + d["height"] for d in existing)
+                y = max_y + 20
+                x = min(d["x"] for d in existing)
+        else:
+            x, y = 100, 100
+
         self.put(eventbox, x, y)
+
         self.monitor_data[eventbox] = {
             "name": name,
-            "monitor": mon,
+            "monitor": monitor,
             "width": w,
             "height": h,
             "x": x,
             "y": y,
             "transform": transform
         }
+
         self.show_all()
 
+
     def remove_monitor(self, name):
-        to_remove = None
-        for widget, data in self.monitor_data.items():
+        for eventbox, data in list(self.monitor_data.items()):
             if data["name"] == name:
-                to_remove = widget
+                self.remove(eventbox)
+                del self.monitor_data[eventbox]
                 break
-        if to_remove:
-            self.remove(to_remove)
-            del self.monitor_data[to_remove]
-            self.queue_draw()
+
 
     def on_resize_recenter(self, widget, allocation):
         old_w, old_h = self.last_allocated_size
@@ -1376,26 +1422,24 @@ class WayDisplaysApp(Gtk.Window):
         self.layout_area._apply_transform_to_shape(widget, new_transform)
 
 
-    def on_monitor_enabled_toggled(self, widget):
-        mon_name = widget.monitor.get("NAME", "Unknown")
-        enabled = widget.enable_switch.get_active()
+    def on_monitor_enabled_toggled(self, monitor, enabled):
+        print(f"[TOGGLE] {monitor['NAME']} -> {'ENABLED' if enabled else 'DISABLED'}")
+        name = monitor.get("NAME", "Unknown")
 
         # Update tab label
-        _, label = self.monitor_tabs.get(mon_name, (None, None))
+        _, label = self.monitor_tabs.get(name, (None, None))
         if label:
-            base_text = mon_name
-            label.set_text(base_text if enabled else f"{base_text} (Disabled)")
+            label.set_text(name if enabled else f"{name} (Disabled)")
 
-        # Update layout area
         if not self.layout_area:
             return
 
         if enabled:
-            # Add to layout
-            self.layout_area.add_monitor(widget.monitor)
+            self.layout_area.remove_monitor(name)
+            self.layout_area.add_monitor(monitor)
         else:
-            # Remove from layout
-            self.layout_area.remove_monitor(mon_name)
+            self.layout_area.add_monitor(monitor)
+            self.layout_area.remove_monitor(name)
 
     def save_config(self, button=None):
         # --- Load existing config YAML ---
