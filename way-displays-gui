@@ -883,13 +883,10 @@ class MonitorLayout(Gtk.Layout):
 
 
     def on_resize_recenter(self, widget, allocation):
-        old_w, old_h = self.last_allocated_size
         new_w, new_h = allocation.width, allocation.height
-        # Only recenter if window *grew* in either direction
-        if new_w > old_w or new_h > old_h:
+        if (new_w, new_h) != self.last_allocated_size:
             GLib.idle_add(self.recenter_all_monitors)
-
-        self.last_allocated_size = (new_w, new_h)
+            self.last_allocated_size = (new_w, new_h)
 
     def _snap_monitors_to_edges(self, tolerance=20):
         items = list(self.monitor_data.items())
