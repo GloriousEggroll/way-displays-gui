@@ -4,6 +4,7 @@ import gi
 import os
 import subprocess
 import yaml
+import time
 
 gi.require_version('Pango', '1.0')
 from gi.repository import Pango
@@ -172,7 +173,7 @@ class MonitorWidget(Gtk.Box):
         adjustment = Gtk.Adjustment(value=scale_value, lower=1.0, upper=2.5, step_increment=0.25, page_increment=0.25, page_size=0)
         self.scale_slider = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment)
         self.scale_slider.set_round_digits(2)
-        self.scale_slider.set_draw_value(True)
+        self.scale_slider.set_draw_value(False)
         self.scale_slider.set_value_pos(Gtk.PositionType.RIGHT)
         self.scale_slider.set_hexpand(True)
         self.scale_slider.set_margin_top(6)
@@ -439,7 +440,8 @@ class MonitorLayout(Gtk.Layout):
         scale = 0.08
         monitor_widgets = []
         for mon in ordered_monitors:
-            name = mon["DESCRIPTION"]
+            name = mon["NAME"]
+            desc = mon["DESCRIPTION"]
             mode = mon.get("CURRENT", {}).get("MODE", {})
             width = mode.get("WIDTH", 1920)
             height = mode.get("HEIGHT", 1080)
@@ -454,15 +456,25 @@ class MonitorLayout(Gtk.Layout):
             frame = Gtk.Frame()
             frame.set_size_request(w, h)
             frame.set_shadow_type(Gtk.ShadowType.IN)
+            frame.set_hexpand(False)
+            frame.set_vexpand(False)
             frame.get_style_context().add_class("monitor-frame")
 
-            label = Gtk.Label(label=f"{name}\n{width}x{height} @ {refresh:.0f}Hz")
+            label = Gtk.Label(label=f"{name}")
+            label.set_line_wrap(True)
+            label.set_line_wrap_mode(Pango.WrapMode.WORD)
+            label.set_max_width_chars(20)
             label.set_justify(Gtk.Justification.CENTER)
+            label.set_halign(Gtk.Align.CENTER)  # horizontal centering
+            label.set_valign(Gtk.Align.CENTER)  # vertical centering
 
+
+            # Use fixed box (optional)
             box = Gtk.Box()
             box.set_halign(Gtk.Align.FILL)
             box.set_valign(Gtk.Align.FILL)
             box.pack_start(label, True, True, 0)
+
             frame.add(box)
 
             eventbox = Gtk.EventBox()
@@ -476,7 +488,7 @@ class MonitorLayout(Gtk.Layout):
             eventbox.connect("button-press-event", self.on_drag_start)
             eventbox.connect("motion-notify-event", self.on_drag_move)
             eventbox.connect("button-release-event", self.on_drag_end)
-            eventbox.connect("button-press-event", self.on_shape_clicked, name)
+            eventbox.connect("button-press-event", self.on_shape_clicked, desc)
 
             # only pack enabled monitors into the layout, but still store meta
             if mon.get("CURRENT", {}).get("ENABLED", True):
@@ -485,10 +497,14 @@ class MonitorLayout(Gtk.Layout):
             # store metadata always
             self.monitor_data[eventbox] = {
                 "name": name,
+                "desc": desc,
                 "width": w,
                 "height": h,
                 "x": 0,
                 "y": 0,
+                "orig_width": width,
+                "orig_height": height,
+                "order": order,
                 "transform": transform
             }
 
@@ -503,8 +519,8 @@ class MonitorLayout(Gtk.Layout):
             max_width = max(max_width, w)
             max_height = max(max_height, h)
 
-        layout_w = self.get_allocated_width() or 1000
-        layout_h = self.get_allocated_height() or 600
+        layout_w = self.get_allocated_width()
+        layout_h = self.get_allocated_height()
 
         # Determine total group size
         if arrange == "ROW":
@@ -545,10 +561,14 @@ class MonitorLayout(Gtk.Layout):
 
             self.monitor_data[eventbox] = {
                 "name": name,
+                "desc": desc,
                 "width": w,
                 "height": h,
                 "x": x,
                 "y": y,
+                "orig_width": width,
+                "orig_height": height,
+                "order": order,
                 "transform": transform
             }
 
@@ -674,7 +694,7 @@ class MonitorLayout(Gtk.Layout):
 
     def get_widget_by_name(self, name):
         for widget, data in self.monitor_data.items():
-            if data["name"] == name:
+            if data["desc"] == name:
                 return widget
         return None
 
@@ -692,7 +712,7 @@ class MonitorLayout(Gtk.Layout):
 
 
     def _apply_transform_to_shape(self, eventbox, transform):
-        name = self.monitor_data[eventbox]["name"]
+        name = self.monitor_data[eventbox]["desc"]
 
         frame = eventbox.get_child()
         if not isinstance(frame, Gtk.Frame):
@@ -1056,10 +1076,14 @@ class MonitorLayout(Gtk.Layout):
     def on_drag_end(self, widget, event):
         info = self.monitor_data[widget]
         name = info["name"]
+        desc = info["desc"]
+        order = info["order"]
         x = info["x"]
         y = info["y"]
         w = info["width"]
         h = info["height"]
+        ow = info["orig_width"]
+        oh = info["orig_height"]
 
         # Snap to other shapes' edges on release
         rects = [
@@ -1073,42 +1097,127 @@ class MonitorLayout(Gtk.Layout):
         self.monitor_data[widget]["x"] = x_snapped
         self.monitor_data[widget]["y"] = y_snapped
 
-        self.show_overlay(name, w, h, x_snapped, y_snapped)
+        print(desc)
+        print(w)
+        print(h)
+        print(x_snapped)
+        print(y_snapped)
+        print(ow)
+        print(oh)
+        print(name)
+        print(order)
+        self.show_overlay(desc, w, h, x_snapped, y_snapped, ow, oh, name, order)
 
         self.drag_data = {"widget": None, "dx": 0, "dy": 0}
 
-
-
-    def on_shape_clicked(self, widget, event, name):
+    def on_shape_clicked(self, widget, event, desc):
         if self.name_to_tab_index and name in self.name_to_tab_index:
             self.notebook.set_current_page(self.name_to_tab_index[name])
 
-    def show_overlay(self, name, width, height, x, y):
+    def show_overlay(self, desc, width, height, x, y, orig_width, orig_height, name, order):
+
         # Create a transparent overlay window
-        win = Gtk.Window(type=Gtk.WindowType.POPUP)
-        win.set_decorated(False)
+        display = Gdk.Display.get_default()
+
+        monitor_index = order.index(desc)
+        print(desc)
+        print(name)
+        print(order)
+        print(monitor_index)
+
+        try:
+            monitor = display.get_monitor(monitor_index)
+        except Exception as e:
+            print(f"Failed to get monitor {monitor_index}: {e}")
+            monitor = display.get_primary_monitor()
+
+        geometry = monitor.get_geometry()
+
+
+        win = Gtk.Window()
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+
         win.set_accept_focus(False)
         win.set_keep_above(True)
         win.set_skip_taskbar_hint(True)
         win.set_skip_pager_hint(True)
-        win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        win.set_type_hint(Gdk.WindowTypeHint.SPLASHSCREEN)
         win.set_app_paintable(True)
-        win.set_opacity(0.85)
+        win.set_decorated(False)
 
         # Add label
-        label = Gtk.Label(label=f"{name}\n{width}x{height}")
+        label = Gtk.Label(label=f"{name}\n{orig_width}x{orig_height}")
         label.set_justify(Gtk.Justification.CENTER)
         label.set_margin_top(10)
         label.set_margin_bottom(10)
         label.set_margin_start(10)
         label.set_margin_end(10)
+        label.get_style_context().add_class("overlay-label")
 
-        # Apply styling
-        frame = Gtk.Frame()
-        frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
-        frame.add(label)
-        win.add(frame)
+        hb = Gtk.HeaderBar()
+        hb.set_title("")
+        hb.set_show_close_button(False)
+        hb.set_has_subtitle(False)
+        hb.set_decoration_layout(":")  # no system buttons
+        hb.get_style_context().add_class("overlay-header")
+
+        # Completely remove it from layout
+        hb.set_size_request(0, 0)
+        hb.set_visible(False)
+
+        # Box that holds the label
+        box = Gtk.Box()
+        box.set_orientation(Gtk.Orientation.VERTICAL)
+        box.set_margin_top(0)
+        box.set_margin_bottom(0)
+        box.set_margin_start(0)
+        box.set_margin_end(0)
+        box.get_style_context().add_class("overlay-box")
+        box.pack_start(label, True, True, 0)
+
+        win.set_titlebar(hb)
+        win.add(box)
+        win.set_size_request(200, 80)
+        win.move(
+            geometry.x + (geometry.width // 2) - 100,
+            geometry.y + (geometry.height // 2) - 40
+        )
         win.show_all()
+
+        # --- Apply CSS styling ---
+        css = b"""
+        .overlay-box {
+            background-color: rgba(0, 0, 0, 0.8);
+            border-radius: 10px;
+        }
+
+        .overlay-label {
+            color: white;
+            font-weight: bold;
+            font-size: 14pt;
+        }
+        headerbar.overlay-header {
+            min-height: 0;
+            padding: 0;
+            margin: 0;
+            border: none;
+            border-width: 0;
+            background: transparent;
+            box-shadow: none;
+            outline: none;
+        }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+
+        screen = win.get_screen()
+        Gtk.StyleContext.add_provider_for_screen(
+            screen,
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
         # Move the window to the center of the monitor (best guess)
         win.set_size_request(200, 80)
@@ -1135,25 +1244,43 @@ class WayDisplaysApp(Gtk.Window):
     def __init__(self):
         Gtk.Window.__init__(self, title="Way Displays GUI")
 
-        self.set_default_size(1280, 900)
+        hb = Gtk.HeaderBar()
+        hb.set_title("Way Displays GUI")
+        hb.set_show_close_button(True)
+        hb.set_has_subtitle(True)
+        hb.set_decoration_layout("menu:minimize,maximize,close")  # no system buttons
+
+        # Completely remove it from layout
+        hb.set_visible(True)
+        self.set_titlebar(hb)
+
+        self.set_decorated(True)  # remove system decorations
+        self.set_default_size(1280, 1000)
 
         settings = Gtk.Settings.get_default()
         settings.set_property("gtk-theme-name", "adw-gtk3-dark")
         settings.set_property("gtk-application-prefer-dark-theme", True)
 
+        self.set_resizable(True)
+
+        # === MAIN LAYOUT ===
         self.monitors_notebook = Gtk.Notebook()
-        self.monitor_widgets = []  # Store widgets for later access if needed
+        self.monitor_widgets = []
         self.monitor_tabs = {}
         self.monitor_tab_indices = {}
 
-        # --- Bottom Bar ---
+        self.layout_area = None
+        self.layout_frame = Gtk.Frame()
+        self.layout_frame.set_shadow_type(Gtk.ShadowType.NONE)
+        self.layout_frame.set_size_request(-1, 380)
+
+        # Bottom bar and notification bar (your existing code)
         bottom_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         bottom_bar.set_margin_top(6)
         bottom_bar.set_margin_bottom(6)
         bottom_bar.set_margin_start(12)
         bottom_bar.set_margin_end(12)
 
-        # --- Notification Bar ---
         notif_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         notif_bar.set_margin_top(6)
         notif_bar.set_margin_bottom(6)
@@ -1162,11 +1289,10 @@ class WayDisplaysApp(Gtk.Window):
 
         self.notify_toggle = Gtk.Switch()
         self.notify_toggle.set_halign(Gtk.Align.END)
-        self.notify_toggle.connect("notify::active", self.on_notify_toggle)
         notif_bar.pack_start(self.notify_toggle, False, False, 0)
         notif_bar.pack_start(Gtk.Label(label="Enable Notifications"), False, False, 0)
 
-        notif_label = Gtk.Label(label="Notification App:")
+        notif_label = Gtk.Label(label="Notification CMD:")
         notif_label.set_halign(Gtk.Align.START)
         notif_bar.pack_start(notif_label, False, False, 0)
 
@@ -1182,22 +1308,17 @@ class WayDisplaysApp(Gtk.Window):
                 callback_cmd = cfg.get("CALLBACK_CMD", "")
 
         default_cb = 'notify-send "way-displays ${CALLBACK_LEVEL}" "${CALLBACK_MSG}"'
-
         if callback_cmd and callback_cmd.strip():
             self.callback_entry.set_text(callback_cmd)
             self.notify_toggle.set_active(True)
-        else:
-            self.callback_entry.set_text(default_cb)
-            self.notify_toggle.set_active(False)
-
+        self.notify_toggle.connect("notify::active", self.on_notify_toggle)
 
         auto_scale_label = Gtk.Label(label="Global Auto Scale (This setting is ignored if per-monitor scaling is set.)")
         auto_scale_label.set_halign(Gtk.Align.START)
 
         self.auto_scale_switch = Gtk.Switch()
-        self.auto_scale_switch.set_active(True)
+        self.auto_scale_switch.connect("notify::active", self.on_autoscale_toggle)
 
-        # Pack into the bar
         bottom_bar.pack_start(self.auto_scale_switch, False, False, 0)
         bottom_bar.pack_start(auto_scale_label, False, False, 0)
 
@@ -1205,41 +1326,60 @@ class WayDisplaysApp(Gtk.Window):
         save_btn.connect("clicked", self.save_config)
         bottom_bar.pack_end(save_btn, False, False, 0)
 
-        # --- Monitor Notebook ---
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_size_request(-1, 500)  # -1 = default width, 500px tall
-        scroll.add(self.monitors_notebook)
-
-        # --- Monitor Arrangement Frame ---
-        self.layout_area = None
-        self.layout_frame = Gtk.Frame(label="Monitor Arrangement")
-        self.layout_frame.set_size_request(1000, 600)
-
-        # Optional: add placeholder label for spacing if no layout yet
-        placeholder = Gtk.Label(label="")
-        self.layout_frame.add(placeholder)
-
-        # --- Main Layout ---
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        main_box.pack_start(self.layout_frame, False, False, 10)  # Always include layout_frame
-        main_box.pack_start(scroll, True, True, 0)
-        main_box.pack_start(notif_bar, False, False, 0)
-        main_box.pack_end(bottom_bar, False, False, 0)
-
-        self.main_area = main_box
+        main_app_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        main_app_content.pack_start(self.layout_frame, False, False, 10)
+        main_app_content.pack_start(self.monitors_notebook, True, True, 0)
+        main_app_content.pack_start(notif_bar, False, False, 0)
+        main_app_content.pack_end(bottom_bar, False, False, 0)
 
         scroll_container = Gtk.ScrolledWindow()
-        scroll_container.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)  # vertical scroll only
+        scroll_container.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll_container.set_vexpand(True)
 
-        # Wrap main_box in a Gtk.Viewport before adding to the ScrolledWindow
         viewport = Gtk.Viewport()
-        viewport.add(main_box)
+        viewport.add(main_app_content)
         scroll_container.add(viewport)
 
-        self.add(scroll_container)
+        # === OUTER BOX (title bar + scroll container) ===
+        outer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer_box.pack_start(scroll_container, True, True, 0)
 
-        # --- Load monitors ---
+        self.add(outer_box)
+
+        # CSS
+        css = b"""
+        #custom-titlebar {
+            background-color: #333336;
+            padding: 6px;
+        }
+
+        #custom-titlebar GtkLabel {
+            color: white;
+            font-weight: bold;
+        }
+
+        #custom-titlebar GtkButton {
+            background-color: transparent;
+            border: none;
+            color: white;
+            margin: 0 4px;
+            border-radius: 4px;
+            padding: 2px 6px;
+        }
+
+        #custom-titlebar GtkButton:hover {
+            background-color: rgba(255, 255, 255, 0.15);
+        }
+        """
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        # App startup
         self.load_monitor_data()
         self.reload_layout()
         self.show_all()
@@ -1262,7 +1402,6 @@ class WayDisplaysApp(Gtk.Window):
             # Combine names:
             all_names = list(dict.fromkeys(list(state_by_name.keys())))
             all_names = [n for n in all_names]
-            print("Final tab list:", all_names)
 
             # Build full monitor objects
             full_monitors = []
@@ -1293,6 +1432,19 @@ class WayDisplaysApp(Gtk.Window):
                             tname = entry.get("DESCRIPTION")
                             if tname == name:
                                 mon.setdefault("OVERRIDES", {})["TRANSFORM"] = entry.get("TRANSFORM")
+
+                # Apply any static SCALE from config
+                scale_list = cfg.get("SCALE", [])
+                if isinstance(scale_list, list):
+                    for entry in scale_list:
+                        if isinstance(entry, dict):
+                            tname = entry.get("DESCRIPTION") or entry.get("NAME_DESC")
+                            if tname == name:
+                                scale_val = entry.get("SCALE")
+                                if isinstance(scale_val, (int, float)):
+                                    # Put the scale into CURRENT so the widget sees it
+                                    mon["CURRENT"]["SCALE"] = scale_val
+
 
                 # Fall back to default transform
                 if "CURRENT" in mon and "TRANSFORM" not in mon["CURRENT"]:
@@ -1362,6 +1514,37 @@ class WayDisplaysApp(Gtk.Window):
                 self.callback_entry.set_text(default_cmd)
         else:
             self.callback_entry.set_text("")
+
+    def on_autoscale_toggle(self, switch, _param):
+        enabled = switch.get_active()
+
+        subprocess.run(["way-displays", "--set", "AUTO_SCALE", "on" if enabled else "off"])
+        subprocess.run(["way-displays", "--write"])
+
+        # --- Re-fetch updated scale info ---
+        try:
+            output = subprocess.check_output(
+                ["way-displays", "--yaml", "--get"],
+                timeout=3
+            ).decode()
+            data = yaml.safe_load(output)
+            state_monitors = data.get("STATE", {}).get("HEADS", [])
+            desc_to_scale = {
+                m["DESCRIPTION"]: m.get("CURRENT", {}).get("SCALE", 1.0)
+                for m in state_monitors
+            }
+        except Exception as e:
+            print(f"[WARN] Failed to refresh monitor states: {e}")
+            return
+
+        # --- Update each tab's scale slider ---
+        for widget in self.monitor_widgets:
+            desc = widget.monitor.get("DESCRIPTION")
+            if desc and desc in desc_to_scale:
+                new_scale = desc_to_scale[desc]
+                widget.scale_slider.set_value(new_scale)
+                widget.monitor["CURRENT"]["SCALE"] = new_scale  # Keep model in sync
+
 
     def _get_refresh_for_resolution(self, name, width, height):
         for widget in self.monitor_widgets:
@@ -1449,6 +1632,7 @@ class WayDisplaysApp(Gtk.Window):
             self.layout_area.remove_monitor(name)
 
     def save_config(self, button=None):
+
         # --- Load existing config YAML ---
         cfg = {}
         if os.path.exists(CONFIG_PATH):
@@ -1538,7 +1722,6 @@ class WayDisplaysApp(Gtk.Window):
 
                 # Apply other way-displays settings
                 subprocess.run(["way-displays", "--set", "MODE", name, w, h, hz])
-                subprocess.run(["way-displays", "--set", "SCALE", name, f"{scale:.2f}"])
                 if not vrr:
                     subprocess.run(["way-displays", "--set", "VRR_OFF", name])
                 else:
@@ -1547,6 +1730,11 @@ class WayDisplaysApp(Gtk.Window):
                     subprocess.run(["way-displays", "--set", "DISABLED", name])
                 else:
                     subprocess.run(["way-displays", "--delete", "DISABLED", name])
+                if scale:
+                    if scale > 1:
+                        subprocess.run(["way-displays", "--set", "SCALE", name, f"{scale:.2f}"])
+                    else:
+                        subprocess.run(["way-displays", "--delete", "SCALE", name])
 
         # --- Save arrangement + alignment ---
         if self.layout_area:
@@ -1654,21 +1842,17 @@ class WayDisplaysApp(Gtk.Window):
             # Alignment
             default_align = "TOP" if auto_arrange == "ROW" else "LEFT"
 
-        # --- Global AutoScale ---
-        global_auto = self.auto_scale_switch.get_active()
-        subprocess.run([
-            "way-displays", "--set", "AUTO_SCALE",
-            "true" if global_auto else "false"
-        ])
 
         subprocess.run(["way-displays", "--set", "ARRANGE_ALIGN", cfg["ARRANGE"], cfg["ALIGN"]])
 
         # --- Write back YAML ---
+        # --- DON'T REMOVE THIS -- IT'S NEEDED FOR OUR MONITOR POSITIONS TO APPLY
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w") as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
 
         subprocess.run(["way-displays", "--write"])
+
         GLib.timeout_add(250, self.reload_layout)
 
     def load_monitor_state(self):
@@ -1687,8 +1871,12 @@ class WayDisplaysApp(Gtk.Window):
 
     def reload_layout(self):
         # Load updated config values
-        with open(CONFIG_PATH, "r") as f:
-            cfg = yaml.safe_load(f)
+        output = subprocess.check_output(
+            ["way-displays", "--yaml", "--get"],
+            timeout=3
+        ).decode()
+        data = yaml.safe_load(output)
+        cfg = data.get("CFG", {})
 
         arrange = cfg.get("ARRANGE", "ROW")
         align = cfg.get("ALIGN", "TOP")
