@@ -1127,7 +1127,8 @@ class MonitorLayout(Gtk.Layout):
 class WayDisplaysApp(Gtk.Window):
     def __init__(self):
         Gtk.Window.__init__(self, title="Way Displays GUI")
-        self.set_default_size(1280, 720)
+
+        self.set_default_size(1280, 900)
 
         settings = Gtk.Settings.get_default()
         settings.set_property("gtk-theme-name", "adw-gtk3-dark")
@@ -1219,7 +1220,17 @@ class WayDisplaysApp(Gtk.Window):
         main_box.pack_end(bottom_bar, False, False, 0)
 
         self.main_area = main_box
-        self.add(main_box)
+
+        scroll_container = Gtk.ScrolledWindow()
+        scroll_container.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)  # vertical scroll only
+        scroll_container.set_vexpand(True)
+
+        # Wrap main_box in a Gtk.Viewport before adding to the ScrolledWindow
+        viewport = Gtk.Viewport()
+        viewport.add(main_box)
+        scroll_container.add(viewport)
+
+        self.add(scroll_container)
 
         # --- Load monitors ---
         self.load_monitor_data()
@@ -1714,7 +1725,6 @@ class WayDisplaysApp(Gtk.Window):
 
         self.layout_frame.add(self.layout_area)
         self.layout_frame.show_all()
-
 
 
 
