@@ -2,9 +2,9 @@
 
 import gi
 import os
-import subprocess
 import yaml
 import time
+import socket
 
 gi.require_version('Pango', '1.0')
 from gi.repository import Pango
@@ -13,31 +13,8 @@ from gi.repository import Pango
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GObject, GLib
 
-CONFIG_PATH = os.path.expandvars("$HOME/.config/way-displays/cfg.yaml")
-
-class MonitorOverlay(Gtk.Window):
-    def __init__(self, name, width, height, refresh, x, y):
-        super().__init__(type=Gtk.WindowType.POPUP)
-        self.set_decorated(False)
-        self.set_accept_focus(False)
-        self.set_keep_above(True)
-        self.set_skip_taskbar_hint(True)
-        self.set_skip_pager_hint(True)
-        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        self.set_app_paintable(True)
-        self.set_opacity(0.85)
-
-        # Size and position
-        self.set_size_request(180, 70)
-        self.move(x + width // 2 - 90, y + height // 2 - 35)
-
-        label = Gtk.Label(label=f"{name}\n{width}x{height} @ {refresh:.0f}Hz")
-        label.set_justify(Gtk.Justification.CENTER)
-        self.add(label)
-        self.show_all()
-
-        # Auto-close after a few seconds
-        GObject.timeout_add(2000, self.close)
+SOCKET_PATH = os.path.expandvars("$XDG_RUNTIME_DIR/way-displays.sock")
+SOCKET_CHUNK_LEN = 8192
 
 class MonitorWidget(Gtk.Box):
     def __init__(self, monitor, on_enabled_toggle=None, on_transform_change=None, on_resolution_change=None):
@@ -48,10 +25,10 @@ class MonitorWidget(Gtk.Box):
         self.set_margin_bottom(12)
         self._on_transform_change = on_transform_change
         self.flip_switch = None
-        name = monitor.get('DESCRIPTION', 'Unknown')
+        desc = monitor.get('DESCRIPTION', 'Unknown')
         make = monitor.get('MAKE', '')
         model = monitor.get('MODEL', '')
-        self.pack_start(Gtk.Label(label=f"{name} ({make} {model})"), False, False, 0)
+        self.pack_start(Gtk.Label(label=f"{desc} ({make} {model})"), False, False, 0)
 
         # ------------------ Resolution Combo ------------------
         self.res_combo = Gtk.ComboBoxText()
@@ -220,7 +197,7 @@ class MonitorWidget(Gtk.Box):
 
         # --- Notify the main app to update config/layout ---
         if self._on_resolution_change:
-            # Pass name + numeric values
+            # Pass desc + numeric values
             self._on_resolution_change(
                 self.monitor["DESCRIPTION"],
                 width,
@@ -229,17 +206,17 @@ class MonitorWidget(Gtk.Box):
             )
 
 
-    def _on_resolution_change(self, name, new_width, new_height, refresh):
+    def _on_resolution_change(self, desc, new_width, new_height, refresh):
         if not self.layout_area:
             return
 
         scale = 0.08
-        widget = self.layout_area.get_widget_by_name(name)
+        widget = self.layout_area.get_widget_by_desc(desc)
         if not widget:
             return
 
         for w, data in self.layout_area.monitor_data.items():
-            if data["name"] == name:
+            if data["desc"] == desc:
                 data["width"] = int(new_width * scale)
                 data["height"] = int(new_height * scale)
                 data["refresh"] = int(refresh * 1000)
@@ -249,7 +226,7 @@ class MonitorWidget(Gtk.Box):
                 frame = w.get_child()
                 box = frame.get_child()
                 label = box.get_children()[0]
-                label.set_text(f"{name}\n{new_width}x{new_height} @ {refresh:.0f}Hz")
+                label.set_text(f"{desc}\n{new_width}x{new_height} @ {refresh:.0f}Hz")
                 break
 
 
@@ -317,10 +294,10 @@ class MonitorWidget(Gtk.Box):
             return None
 
         selected_mode = self.monitor["MODES"][selected_index]
-        name = self.monitor["DESCRIPTION"]
+        desc = self.monitor["DESCRIPTION"]
 
         return {
-            "name": name,
+            "desc": desc,
             "width": selected_mode["WIDTH"],
             "height": selected_mode["HEIGHT"],
             "refresh": selected_mode["REFRESH_MHZ"],
@@ -330,6 +307,26 @@ class MonitorWidget(Gtk.Box):
             "transform": self.get_transform(),  # <--- add transform here
         }
 
+def ipc_operation(operation, payload=""):
+    raw = b''
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+
+            # attempt to send to the socket
+            client.connect(SOCKET_PATH)
+            client.send(f"OP: {operation}\n{payload}".encode("utf-8"))
+
+            # read responses until the server is done
+            chunk = None
+            while chunk != b'':
+                chunk = client.recv(SOCKET_CHUNK_LEN);
+                raw += chunk
+
+        except FileNotFoundError:
+            print(f"way-displays socket {SOCKET_PATH} not found. Is the server running? Are $WAYLAND_DISPLAY and $XDG_VTNR set?")
+
+    return raw.decode("utf-8")
 
 def snap_to_edges(x, y, rects, width, height, margin=0):
     snap_threshold = 30
@@ -359,16 +356,16 @@ def rotated_dimensions(width, height, transform):
     return width, height
 
 class MonitorLayout(Gtk.Layout):
-    def __init__(self, monitors, notebook, name_to_tab_index, align=None, arrange=None, order=None, transform_overrides=None):
+    def __init__(self, monitors, notebook, desc_to_tab_index, align=None, arrange=None, order=None, transform_overrides=None):
         super().__init__()
         self.align = align
         self.arrange = arrange
         self._current_arrange = arrange.upper()
         self._current_align = align.upper()
-        self.set_size(1000, 600)
+        self.set_size(1280, 720)
         self.monitor_data = {}
         self.notebook = notebook
-        self.name_to_tab_index = name_to_tab_index
+        self.desc_to_tab_index = desc_to_tab_index
         self.drag_data = {"widget": None, "dx": 0, "dy": 0}
         self.last_allocated_size = (self.get_allocated_width(), self.get_allocated_height())
         self.connect("size-allocate", self.on_resize_recenter)
@@ -397,12 +394,16 @@ class MonitorLayout(Gtk.Layout):
         transform_overrides = transform_overrides or {}
         # --- Load config for arrange/align/order ---
         config_arrange, config_align, config_order = "ROW", "TOP", []
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r") as f:
-                cfg = yaml.safe_load(f)
-                config_arrange = cfg.get("ARRANGE", "ROW")
-                config_align = cfg.get("ALIGN", "TOP")
-                config_order = cfg.get("ORDER", [])
+
+
+
+        if os.path.exists(SOCKET_PATH):
+            output = ipc_operation("GET")
+            data = yaml.safe_load(output)
+            cfg = data.get("CFG", {})
+            config_arrange = cfg.get("ARRANGE", "ROW")
+            config_align = cfg.get("ALIGN", "TOP")
+            config_order = cfg.get("ORDER", [])
 
         # Respect constructor align override
         align = (align or config_align or "TOP").upper()
@@ -417,23 +418,23 @@ class MonitorLayout(Gtk.Layout):
         ordered_monitors = []
         seen_names = set()
 
-        for name in order:
-            if name in monitor_map:
-                m = monitor_map[name]
+        for desc in order:
+            if desc in monitor_map:
+                m = monitor_map[desc]
                 m = m.copy()  # shallow copy is fine unless deeply nested, adjust if needed
                 m["OVERRIDES"] = {}
-                if transform_overrides and name in transform_overrides:
-                    m["OVERRIDES"]["TRANSFORM"] = transform_overrides[name]
+                if transform_overrides and desc in transform_overrides:
+                    m["OVERRIDES"]["TRANSFORM"] = transform_overrides[desc]
                 ordered_monitors.append(m)
-                seen_names.add(name)
+                seen_names.add(desc)
 
         # Append any not in ORDER
-        for name, m in monitor_map.items():
-            if name not in seen_names:
+        for desc, m in monitor_map.items():
+            if desc not in seen_names:
                 m = m.copy()
                 m["OVERRIDES"] = {}
-                if transform_overrides and name in transform_overrides:
-                    m["OVERRIDES"]["TRANSFORM"] = transform_overrides[name]
+                if transform_overrides and desc in transform_overrides:
+                    m["OVERRIDES"]["TRANSFORM"] = transform_overrides[desc]
                 ordered_monitors.append(m)
 
         # Create monitor widgets and compute their sizes
@@ -492,7 +493,7 @@ class MonitorLayout(Gtk.Layout):
 
             # only pack enabled monitors into the layout, but still store meta
             if mon.get("CURRENT", {}).get("ENABLED", True):
-                monitor_widgets.append((eventbox, name, w, h, transform))
+                monitor_widgets.append((eventbox, name, desc, w, h, width, height, order, transform))
 
             # store metadata always
             self.monitor_data[eventbox] = {
@@ -513,7 +514,7 @@ class MonitorLayout(Gtk.Layout):
         padding = 0  # No gaps between
         total_width = total_height = 0
         max_width = max_height = 0
-        for _, _, w, h, _ in monitor_widgets:
+        for _, _, _, w, h, _, _, _, _ in monitor_widgets:
             total_width += w + padding
             total_height += h + padding
             max_width = max(max_width, w)
@@ -524,11 +525,11 @@ class MonitorLayout(Gtk.Layout):
 
         # Determine total group size
         if arrange == "ROW":
-            group_width = sum(w for _, _, w, _, _ in monitor_widgets)
+            group_width = sum(w for _, _, _, w, _, _, _, _, _ in monitor_widgets)
             group_height = max_height
         else:
             group_width = max_width
-            group_height = sum(h for _, _, _, h, _ in monitor_widgets)
+            group_height = sum(h for _, _, _, _, h, _, _, _, _ in monitor_widgets)
 
         # Center point for layout
         offset_x = (layout_w - group_width) // 2
@@ -538,7 +539,7 @@ class MonitorLayout(Gtk.Layout):
         x_cursor = offset_x
         y_cursor = offset_y
 
-        for eventbox, name, w, h, transform in monitor_widgets:
+        for eventbox, name, desc, w, h, orig_width, orig_height, order, transform in monitor_widgets:
             # Alignment
             if arrange == "ROW":
                 y = y_cursor
@@ -566,8 +567,8 @@ class MonitorLayout(Gtk.Layout):
                 "height": h,
                 "x": x,
                 "y": y,
-                "orig_width": width,
-                "orig_height": height,
+                "orig_width": orig_width,
+                "orig_height": orig_height,
                 "order": order,
                 "transform": transform
             }
@@ -634,11 +635,11 @@ class MonitorLayout(Gtk.Layout):
 
         positions = []
         for eventbox, meta in self.monitor_data.items():
-            widget = self.get_widget_by_name(meta["name"])
+            widget = self.get_widget_by_desc(meta["desc"])
             if widget:
                 alloc = widget.get_allocation()
                 positions.append({
-                    "name": meta["name"],
+                    "desc": meta["desc"],
                     "widget": widget,
                     "x": alloc.x,
                     "y": alloc.y,
@@ -692,9 +693,9 @@ class MonitorLayout(Gtk.Layout):
 
 
 
-    def get_widget_by_name(self, name):
+    def get_widget_by_desc(self, desc):
         for widget, data in self.monitor_data.items():
-            if data["desc"] == name:
+            if data["desc"] == desc:
                 return widget
         return None
 
@@ -712,7 +713,7 @@ class MonitorLayout(Gtk.Layout):
 
 
     def _apply_transform_to_shape(self, eventbox, transform):
-        name = self.monitor_data[eventbox]["desc"]
+        desc = self.monitor_data[eventbox]["desc"]
 
         frame = eventbox.get_child()
         if not isinstance(frame, Gtk.Frame):
@@ -812,11 +813,11 @@ class MonitorLayout(Gtk.Layout):
 
 
     def add_monitor(self, monitor):
-        name = monitor["DESCRIPTION"]
+        desc = monitor["DESCRIPTION"]
 
         for child in self.get_children():
             child_data = self.monitor_data.get(child)
-            if child_data and child_data["name"] == name:
+            if child_data and child_data["desc"] == desc:
                 return  # Still visible, skip
 
         mode = monitor.get("CURRENT", {}).get("MODE", {})
@@ -838,7 +839,7 @@ class MonitorLayout(Gtk.Layout):
         frame.set_shadow_type(Gtk.ShadowType.IN)
         frame.get_style_context().add_class("monitor-frame")
 
-        label = Gtk.Label(label=f"{name}\n{width}x{height} @ {refresh:.0f}Hz")
+        label = Gtk.Label(label=f"{desc}\n{width}x{height} @ {refresh:.0f}Hz")
         label.set_justify(Gtk.Justification.CENTER)
 
         box = Gtk.Box()
@@ -858,7 +859,7 @@ class MonitorLayout(Gtk.Layout):
         eventbox.connect("button-press-event", self.on_drag_start)
         eventbox.connect("motion-notify-event", self.on_drag_move)
         eventbox.connect("button-release-event", self.on_drag_end)
-        eventbox.connect("button-press-event", self.on_shape_clicked, name)
+        eventbox.connect("button-press-event", self.on_shape_clicked, desc)
 
         # Default placement in center or (100,100)
         existing = list(self.monitor_data.values())
@@ -879,7 +880,7 @@ class MonitorLayout(Gtk.Layout):
         self.put(eventbox, x, y)
 
         self.monitor_data[eventbox] = {
-            "name": name,
+            "desc": desc,
             "monitor": monitor,
             "width": w,
             "height": h,
@@ -891,9 +892,9 @@ class MonitorLayout(Gtk.Layout):
         self.show_all()
 
 
-    def remove_monitor(self, name):
+    def remove_monitor(self, desc):
         for eventbox, data in list(self.monitor_data.items()):
-            if data["name"] == name:
+            if data["desc"] == desc:
                 self.remove(eventbox)
                 del self.monitor_data[eventbox]
                 break
@@ -1044,8 +1045,13 @@ class MonitorLayout(Gtk.Layout):
             "widget": widget,
             "dx": event.x,
             "dy": event.y,
+            "desc": self.monitor_data[widget]["desc"],
             "start_x": self.monitor_data[widget]["x"],
             "start_y": self.monitor_data[widget]["y"],
+            "orig_width": self.monitor_data[widget]["orig_width"],
+            "orig_height": self.monitor_data[widget]["orig_height"],
+            "name": self.monitor_data[widget]["name"],
+            "order": self.monitor_data[widget]["order"],
         }
 
     def on_drag_move(self, widget, event):
@@ -1074,67 +1080,43 @@ class MonitorLayout(Gtk.Layout):
 
 
     def on_drag_end(self, widget, event):
-        info = self.monitor_data[widget]
-        name = info["name"]
-        desc = info["desc"]
-        order = info["order"]
+        eventbox = self.drag_data["widget"]
+        info = self.monitor_data[eventbox]
+
         x = info["x"]
         y = info["y"]
         w = info["width"]
         h = info["height"]
         ow = info["orig_width"]
         oh = info["orig_height"]
+        name = info["name"]
+        desc = info["desc"]
+        order = info["order"]
 
         # Snap to other shapes' edges on release
         rects = [
             (data["x"], data["y"], data["width"], data["height"])
             for wgt, data in self.monitor_data.items()
-            if wgt != widget
+            if wgt != eventbox
         ]
         x_snapped, y_snapped = snap_to_edges(x, y, rects, w, h)
 
-        self.move(widget, x_snapped, y_snapped)
-        self.monitor_data[widget]["x"] = x_snapped
-        self.monitor_data[widget]["y"] = y_snapped
+        self.move(eventbox, x_snapped, y_snapped)
+        self.monitor_data[eventbox]["x"] = x_snapped
+        self.monitor_data[eventbox]["y"] = y_snapped
 
-        print(desc)
-        print(w)
-        print(h)
-        print(x_snapped)
-        print(y_snapped)
-        print(ow)
-        print(oh)
-        print(name)
-        print(order)
         self.show_overlay(desc, w, h, x_snapped, y_snapped, ow, oh, name, order)
 
         self.drag_data = {"widget": None, "dx": 0, "dy": 0}
 
+
     def on_shape_clicked(self, widget, event, desc):
-        if self.name_to_tab_index and name in self.name_to_tab_index:
-            self.notebook.set_current_page(self.name_to_tab_index[name])
+        if self.desc_to_tab_index and desc in self.desc_to_tab_index:
+            self.notebook.set_current_page(self.desc_to_tab_index[desc])
 
     def show_overlay(self, desc, width, height, x, y, orig_width, orig_height, name, order):
-
-        # Create a transparent overlay window
-        display = Gdk.Display.get_default()
-
-        monitor_index = order.index(desc)
-        print(desc)
-        print(name)
-        print(order)
-        print(monitor_index)
-
-        try:
-            monitor = display.get_monitor(monitor_index)
-        except Exception as e:
-            print(f"Failed to get monitor {monitor_index}: {e}")
-            monitor = display.get_primary_monitor()
-
-        geometry = monitor.get_geometry()
-
-
         win = Gtk.Window()
+
         visual = win.get_screen().get_rgba_visual()
         if visual:
             win.set_visual(visual)
@@ -1143,53 +1125,44 @@ class MonitorLayout(Gtk.Layout):
         win.set_keep_above(True)
         win.set_skip_taskbar_hint(True)
         win.set_skip_pager_hint(True)
-        win.set_type_hint(Gdk.WindowTypeHint.SPLASHSCREEN)
+        #win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
         win.set_app_paintable(True)
         win.set_decorated(False)
+        win.set_resizable(False)
 
-        # Add label
+        # Required: Add invisible header to suppress decorations
+        hb = Gtk.HeaderBar()
+        hb.set_title("")
+        hb.set_show_close_button(False)
+        hb.set_has_subtitle(False)
+        hb.set_decoration_layout(":")
+        hb.set_size_request(0, 0)
+        hb.set_visible(False)
+        win.set_titlebar(hb)
+
+        # --- Label and styling ---
         label = Gtk.Label(label=f"{name}\n{orig_width}x{orig_height}")
         label.set_justify(Gtk.Justification.CENTER)
+        label.set_line_wrap(True)
+        label.set_line_wrap_mode(Pango.WrapMode.WORD)
+        label.set_max_width_chars(25)
         label.set_margin_top(10)
         label.set_margin_bottom(10)
         label.set_margin_start(10)
         label.set_margin_end(10)
         label.get_style_context().add_class("overlay-label")
 
-        hb = Gtk.HeaderBar()
-        hb.set_title("")
-        hb.set_show_close_button(False)
-        hb.set_has_subtitle(False)
-        hb.set_decoration_layout(":")  # no system buttons
-        hb.get_style_context().add_class("overlay-header")
-
-        # Completely remove it from layout
-        hb.set_size_request(0, 0)
-        hb.set_visible(False)
-
-        # Box that holds the label
-        box = Gtk.Box()
-        box.set_orientation(Gtk.Orientation.VERTICAL)
-        box.set_margin_top(0)
-        box.set_margin_bottom(0)
-        box.set_margin_start(0)
-        box.set_margin_end(0)
-        box.get_style_context().add_class("overlay-box")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.pack_start(label, True, True, 0)
+        box.get_style_context().add_class("overlay-box")
 
-        win.set_titlebar(hb)
         win.add(box)
         win.set_size_request(200, 80)
-        win.move(
-            geometry.x + (geometry.width // 2) - 100,
-            geometry.y + (geometry.height // 2) - 40
-        )
-        win.show_all()
 
-        # --- Apply CSS styling ---
+        # --- CSS styling ---
         css = b"""
         .overlay-box {
-            background-color: rgba(0, 0, 0, 0.8);
+            background-color: rgba(0, 0, 0, 0.85);
             border-radius: 10px;
         }
 
@@ -1198,33 +1171,34 @@ class MonitorLayout(Gtk.Layout):
             font-weight: bold;
             font-size: 14pt;
         }
-        headerbar.overlay-header {
+
+        headerbar {
+            background: transparent;
             min-height: 0;
             padding: 0;
             margin: 0;
             border: none;
-            border-width: 0;
-            background: transparent;
             box-shadow: none;
-            outline: none;
         }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
 
-        screen = win.get_screen()
         Gtk.StyleContext.add_provider_for_screen(
-            screen,
+            win.get_screen(),
             provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-        # Move the window to the center of the monitor (best guess)
-        win.set_size_request(200, 80)
-        win.move(x + width // 2 - 100, y + height // 2 - 40)
+        # --- Force position to second screen ---
+        win.move(3840, 0)  # (X, Y) coordinate
+        win.show_all()
 
-        # Auto-close after 2 seconds
+        # Auto-destroy after 2 seconds
         GLib.timeout_add(2000, win.destroy)
+
+
+
 
 
 
@@ -1235,7 +1209,7 @@ class MonitorLayout(Gtk.Layout):
 
     def get_positions(self):
         return {
-            data["name"]: (data["x"], data["y"])
+            data["desc"]: (data["x"], data["y"])
             for widget, data in self.monitor_data.items()
         }
 
@@ -1272,7 +1246,9 @@ class WayDisplaysApp(Gtk.Window):
         self.layout_area = None
         self.layout_frame = Gtk.Frame()
         self.layout_frame.set_shadow_type(Gtk.ShadowType.NONE)
-        self.layout_frame.set_size_request(-1, 380)
+        #self.layout_frame.set_size_request(-1, 300)
+        self.layout_frame.set_hexpand(True)
+        self.layout_frame.set_vexpand(True)
 
         # Bottom bar and notification bar (your existing code)
         bottom_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -1302,15 +1278,16 @@ class WayDisplaysApp(Gtk.Window):
 
         # Load CALLBACK_CMD from config (or fallback)
         callback_cmd = ""
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r") as f:
-                cfg = yaml.safe_load(f)
-                callback_cmd = cfg.get("CALLBACK_CMD", "")
+        if os.path.exists(SOCKET_PATH):
+            output = ipc_operation("GET")
+            data = yaml.safe_load(output)
+            cfg = data.get("CFG", {})
+            callback_cmd = cfg.get("CALLBACK_CMD", "")
 
-        default_cb = 'notify-send "way-displays ${CALLBACK_LEVEL}" "${CALLBACK_MSG}"'
         if callback_cmd and callback_cmd.strip():
             self.callback_entry.set_text(callback_cmd)
             self.notify_toggle.set_active(True)
+        self.callback_entry.connect("changed", self.on_callback_entry_changed)
         self.notify_toggle.connect("notify::active", self.on_notify_toggle)
 
         auto_scale_label = Gtk.Label(label="Global Auto Scale (This setting is ignored if per-monitor scaling is set.)")
@@ -1327,7 +1304,7 @@ class WayDisplaysApp(Gtk.Window):
         bottom_bar.pack_end(save_btn, False, False, 0)
 
         main_app_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        main_app_content.pack_start(self.layout_frame, False, False, 10)
+        main_app_content.pack_start(self.layout_frame, True, True, 10)
         main_app_content.pack_start(self.monitors_notebook, True, True, 0)
         main_app_content.pack_start(notif_bar, False, False, 0)
         main_app_content.pack_end(bottom_bar, False, False, 0)
@@ -1386,10 +1363,7 @@ class WayDisplaysApp(Gtk.Window):
 
     def load_monitor_data(self):
         try:
-            output = subprocess.check_output(
-                ["way-displays", "--yaml", "--get"],
-                timeout=3
-            ).decode()
+            output = ipc_operation("GET")
             data = yaml.safe_load(output)
             cfg = data.get("CFG", {})
             global_auto_scale = cfg.get("AUTO_SCALE", True)
@@ -1397,20 +1371,20 @@ class WayDisplaysApp(Gtk.Window):
 
             # Runtime monitor info
             state_monitors = data.get("STATE", {}).get("HEADS", [])
-            state_by_name = {mon["DESCRIPTION"]: mon for mon in state_monitors}
+            state_by_desc = {mon["DESCRIPTION"]: mon for mon in state_monitors}
 
             # Combine names:
-            all_names = list(dict.fromkeys(list(state_by_name.keys())))
+            all_names = list(dict.fromkeys(list(state_by_desc.keys())))
             all_names = [n for n in all_names]
 
             # Build full monitor objects
             full_monitors = []
-            for name in all_names:
-                mon = state_by_name.get(name)
+            for desc in all_names:
+                mon = state_by_desc.get(desc)
                 if not mon:
                     # synthesize config-only entry
                     mon = {
-                        "DESCRIPTION": name,
+                        "DESCRIPTION": desc,
                         "CURRENT": {
                             "ENABLED": False,
                             "MODE": {
@@ -1430,7 +1404,7 @@ class WayDisplaysApp(Gtk.Window):
                     for entry in transform_list:
                         if isinstance(entry, dict):
                             tname = entry.get("DESCRIPTION")
-                            if tname == name:
+                            if tname == desc:
                                 mon.setdefault("OVERRIDES", {})["TRANSFORM"] = entry.get("TRANSFORM")
 
                 # Apply any static SCALE from config
@@ -1439,7 +1413,7 @@ class WayDisplaysApp(Gtk.Window):
                     for entry in scale_list:
                         if isinstance(entry, dict):
                             tname = entry.get("DESCRIPTION") or entry.get("NAME_DESC")
-                            if tname == name:
+                            if tname == desc:
                                 scale_val = entry.get("SCALE")
                                 if isinstance(scale_val, (int, float)):
                                     # Put the scale into CURRENT so the widget sees it
@@ -1493,16 +1467,26 @@ class WayDisplaysApp(Gtk.Window):
 
             # Apply transforms to layout
             for mon in enabled_monitors:
-                name = mon["DESCRIPTION"]
-                widget = self.monitor_tabs.get(name, (None,))[0]
+                desc = mon["DESCRIPTION"]
+                widget = self.monitor_tabs.get(desc, (None,))[0]
                 if widget:
                     transform = widget.get_transform()
-                    self.on_transform_change(name, transform)
+                    self.on_transform_change(desc, transform)
 
-        except subprocess.CalledProcessError as e:
-            print("Failed to run way-displays:", e)
-        except subprocess.TimeoutExpired:
-            print("Timeout while waiting for way-displays response.")
+        except:
+            print(f"Failed to retrieve data from way-displays socket {SOCKET_PATH}. Is way-displays running?")
+
+    def on_callback_entry_changed(self, entry):
+        text = entry.get_text().strip()
+
+        # Only do something if text meets your condition
+        if text:
+            entry.handler_block_by_func(self.on_callback_entry_changed)
+            # Example: ensure it always ends with a semicolon
+            if not text.endswith(""):
+                entry.set_text(text + "")
+                entry.set_position(-1)
+            entry.handler_unblock_by_func(self.on_callback_entry_changed)
 
     def on_notify_toggle(self, switch, _param):
         enabled = switch.get_active()
@@ -1510,61 +1494,58 @@ class WayDisplaysApp(Gtk.Window):
         current = self.callback_entry.get_text().strip()
 
         if enabled:
+            self.callback_entry.set_sensitive(True)
             if not current:
                 self.callback_entry.set_text(default_cmd)
+            ipc_operation("CFG_SET", f"CFG:\n  CALLBACK_CMD: {self.callback_entry.get_text().strip()}")
         else:
+            self.callback_entry.set_sensitive(False)
             self.callback_entry.set_text("")
+            ipc_operation("CFG_SET", f"CFG:\n  CALLBACK_CMD: \"\"")
 
     def on_autoscale_toggle(self, switch, _param):
         enabled = switch.get_active()
 
-        subprocess.run(["way-displays", "--set", "AUTO_SCALE", "on" if enabled else "off"])
-        subprocess.run(["way-displays", "--write"])
+        ipc_operation("CFG_SET", f"CFG:\n  AUTO_SCALE: {enabled}");
 
         # --- Re-fetch updated scale info ---
         try:
-            output = subprocess.check_output(
-                ["way-displays", "--yaml", "--get"],
-                timeout=3
-            ).decode()
+            output = ipc_operation("GET")
             data = yaml.safe_load(output)
             state_monitors = data.get("STATE", {}).get("HEADS", [])
+            if not enabled:
+                for m in state_monitors:
+                    ipc_operation("CFG_SET", f"CFG:\n  SCALE:\n    - NAME_DESC: {m["DESCRIPTION"]}\n      SCALE: 1")
+                    ipc_operation("CFG_DEL", f"CFG:\n  SCALE:\n    - NAME_DESC: {m["DESCRIPTION"]}\n      SCALE: 1")
+
             desc_to_scale = {
                 m["DESCRIPTION"]: m.get("CURRENT", {}).get("SCALE", 1.0)
                 for m in state_monitors
             }
+            # --- Update each tab's scale slider ---
+            for widget in self.monitor_widgets:
+                desc = widget.monitor.get("DESCRIPTION")
+                if desc and desc in desc_to_scale:
+                    new_scale = desc_to_scale[desc]
+                    widget.scale_slider.set_value(new_scale)
+                    widget.monitor["CURRENT"]["SCALE"] = new_scale  # Keep model in sync
+
+            ipc_operation("CFG_WRITE")
         except Exception as e:
             print(f"[WARN] Failed to refresh monitor states: {e}")
             return
 
-        # --- Update each tab's scale slider ---
-        for widget in self.monitor_widgets:
-            desc = widget.monitor.get("DESCRIPTION")
-            if desc and desc in desc_to_scale:
-                new_scale = desc_to_scale[desc]
-                widget.scale_slider.set_value(new_scale)
-                widget.monitor["CURRENT"]["SCALE"] = new_scale  # Keep model in sync
-
-
-    def _get_refresh_for_resolution(self, name, width, height):
-        for widget in self.monitor_widgets:
-            if widget.monitor.get("DESCRIPTION") == name:
-                for mode in widget.monitor.get("MODES", []):
-                    if mode.get("WIDTH") == width and mode.get("HEIGHT") == height:
-                        return mode.get("REFRESH_MHZ", 60000)
-        return 60000
-
-    def on_resolution_change(self, name, width, height, refresh):
+    def on_resolution_change(self, desc, width, height, refresh):
         if not self.layout_area:
             return
 
         scale = 0.08
-        widget = self.layout_area.get_widget_by_name(name)
+        widget = self.layout_area.get_widget_by_desc(desc)
         if not widget:
             return
 
         for w, data in self.layout_area.monitor_data.items():
-            if data["name"] == name:
+            if data["desc"] == desc:
                 data["width"] = int(width * scale)
                 data["height"] = int(height * scale)
                 data["refresh"] = refresh
@@ -1574,15 +1555,15 @@ class WayDisplaysApp(Gtk.Window):
                 frame = w.get_child()  # Gtk.Frame
                 box = frame.get_child()  # Gtk.Box
                 label = box.get_children()[0]  # Gtk.Label
-                label.set_text(f"{name}\n{width}x{height} @ {refresh:.2f}Hz")
+                label.set_text(f"{desc}\n{width}x{height} @ {refresh:.2f}Hz")
                 break
 
 
-    def on_transform_change(self, name, new_transform):
+    def on_transform_change(self, desc, new_transform):
         if not self.layout_area:
             return
 
-        widget = self.layout_area.get_widget_by_name(name)
+        widget = self.layout_area.get_widget_by_desc(desc)
         if not widget:
             return
 
@@ -1590,7 +1571,7 @@ class WayDisplaysApp(Gtk.Window):
 
         # 🔥 NEW: Update width/height in layout metadata
         for w, data in self.layout_area.monitor_data.items():
-            if data["name"] == name:
+            if data["desc"] == desc:
                 current_w = data["width"]
                 current_h = data["height"]
 
@@ -1598,7 +1579,7 @@ class WayDisplaysApp(Gtk.Window):
                     data["width"], data["height"] = current_h, current_w
                 else:
                     # fallback: use current tab to re-fetch base mode dimensions
-                    tab_widget = self.monitor_tabs.get(name, (None,))[0]
+                    tab_widget = self.monitor_tabs.get(desc, (None,))[0]
                     if tab_widget:
                         state = tab_widget.get_desired_state()
                         scale = 0.08
@@ -1614,30 +1595,29 @@ class WayDisplaysApp(Gtk.Window):
 
     def on_monitor_enabled_toggled(self, monitor, enabled):
         print(f"[TOGGLE] {monitor['DESCRIPTION']} -> {'ENABLED' if enabled else 'DISABLED'}")
-        name = monitor.get("DESCRIPTION", "Unknown")
+        desc = monitor.get("DESCRIPTION", "Unknown")
 
         # Update tab label
-        _, label = self.monitor_tabs.get(name, (None, None))
+        _, label = self.monitor_tabs.get(desc, (None, None))
         if label:
-            label.set_text(name if enabled else f"{name} (Disabled)")
+            label.set_text(desc if enabled else f"{desc} (Disabled)")
 
         if not self.layout_area:
             return
 
         if enabled:
-            self.layout_area.remove_monitor(name)
+            self.layout_area.remove_monitor(desc)
             self.layout_area.add_monitor(monitor)
         else:
             self.layout_area.add_monitor(monitor)
-            self.layout_area.remove_monitor(name)
+            self.layout_area.remove_monitor(desc)
 
     def save_config(self, button=None):
 
         # --- Load existing config YAML ---
-        cfg = {}
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r") as f:
-                cfg = yaml.safe_load(f) or {}
+        output = ipc_operation("GET")
+        data = yaml.safe_load(output)
+        cfg = data.get("CFG", {})
 
         # Ensure sections exist
         cfg.setdefault("MODE", [])
@@ -1647,15 +1627,15 @@ class WayDisplaysApp(Gtk.Window):
         cfg.setdefault("TRANSFORM", [])
 
         # Helper to update (or add) entry in a list of dicts
-        def upsert_entry(lst, name_key, name_value, key, value):
+        def upsert_entry(lst, desc_key, desc_value, key, value):
             found = False
             for entry in lst:
-                if isinstance(entry, dict) and (entry.get("DESCRIPTION") == name_value):
+                if isinstance(entry, dict) and (entry.get("DESCRIPTION") == desc_value):
                     entry[key] = value
                     found = True
                     break
             if not found:
-                lst.append({name_key: name_value, key: value})
+                lst.append({desc_key: desc_value, key: value})
 
         # --- Apply monitor states ---
         for widget in self.monitor_widgets:
@@ -1664,11 +1644,7 @@ class WayDisplaysApp(Gtk.Window):
                 if state is None:
                     continue
 
-                # Save CALLBACK_CMD
-                callback_value = self.callback_entry.get_text().strip() if self.notify_toggle.get_active() else ""
-                cfg["CALLBACK_CMD"] = callback_value
-
-                name = state["name"]
+                desc = state["desc"]
                 w = str(state["width"])
                 h = str(state["height"])
                 hz = str(state["refresh"] // 1000)
@@ -1677,74 +1653,53 @@ class WayDisplaysApp(Gtk.Window):
                 scale = state["scale"]
                 transform = state.get("transform")
 
-                # MODE
-                upsert_entry(cfg["MODE"], "DESCRIPTION", name, "WIDTH", int(w))
-                upsert_entry(cfg["MODE"], "DESCRIPTION", name, "HEIGHT", int(h))
-                upsert_entry(cfg["MODE"], "DESCRIPTION", name, "HZ", int(hz))
+                upsert_entry(cfg["MODE"], "DESCRIPTION", desc, "WIDTH", int(w))
+                upsert_entry(cfg["MODE"], "DESCRIPTION", desc, "HEIGHT", int(h))
+                upsert_entry(cfg["MODE"], "DESCRIPTION", desc, "HZ", int(hz))
+                upsert_entry(cfg["SCALE"], "DESCRIPTION", desc, "SCALE", float(scale))
+                upsert_entry(cfg["TRANSFORM"], "DESCRIPTION", desc, "TRANSFORM", transform)
+
+                # MODE CHANGE
+                if w and h and hz:
+                    ipc_operation("CFG_SET", f"CFG:\n  MODE:\n    - NAME_DESC: {desc}\n      WIDTH: {w}\n      HEIGHT: {h}\n      HZ: {hz}");
+
+                # VRR
+                if not vrr:
+                    ipc_operation("CFG_SET", f"CFG:\n  VRR_OFF:\n    - {desc}");
+                else:
+                    ipc_operation("CFG_DEL", f"CFG:\n  VRR_OFF:\n    - {desc}");
+
+                # ENABLE/DISABLE
+                if not enabled:
+                    ipc_operation("CFG_SET", f"CFG:\n  DISABLED:\n    - {desc}");
+                else:
+                    ipc_operation("CFG_DEL", f"CFG:\n  DISABLED:\n    - {desc}");
 
                 # SCALE
-                upsert_entry(cfg["SCALE"], "DESCRIPTION", name, "SCALE", float(scale))
-
-                # VRR_OFF
-                if not vrr:
-                    if name not in [(entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) for entry in cfg["VRR_OFF"]]:
-                        cfg["VRR_OFF"].append(name)
-                else:
-                    cfg["VRR_OFF"] = [
-                        entry for entry in cfg["VRR_OFF"]
-                        if (entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) != name
-                    ]
-
-                # DISABLED
-                if not enabled:
-                    if name not in [(entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) for entry in cfg["DISABLED"]]:
-                        cfg["DISABLED"].append(name)
-                else:
-                    cfg["DISABLED"] = [
-                        entry for entry in cfg["DISABLED"]
-                        if (entry.get("DESCRIPTION") if isinstance(entry, dict) else entry) != name
-                    ]
+                if scale:
+                    if scale > 1:
+                        ipc_operation("CFG_SET", f"CFG:\n  SCALE:\n    - NAME_DESC: {desc}\n      SCALE: {scale:.2f}")
+                    else:
+                        ipc_operation("CFG_SET", f"CFG:\n  SCALE:\n    - NAME_DESC: {desc}\n      SCALE: 1")
+                        ipc_operation("CFG_DEL", f"CFG:\n  SCALE:\n    - NAME_DESC: {desc}\n      SCALE: 1");
 
                 # TRANSFORM
                 if transform:
-                    upsert_entry(cfg["TRANSFORM"], "DESCRIPTION", name, "TRANSFORM", transform)
-                    subprocess.run(["way-displays", "--set", "TRANSFORM", name, transform])
-                else:
-                    cfg["TRANSFORM"] = [
-                        entry for entry in cfg["TRANSFORM"]
-                        if isinstance(entry, dict) and entry.get("DESCRIPTION") != name
-                    ]
-                    subprocess.run(["way-displays", "--delete", "TRANSFORM", name])
+                    ipc_operation("CFG_SET", f"CFG:\n  TRANSFORM:\n    - NAME_DESC: {desc}\n      TRANSFORM: {transform}")
 
-                # CALLBACK NOTIFICATIONS COMMAAND
-                if callback_value:
-                    subprocess.run(["way-displays", "--set", "CALLBACK_CMD", callback_value])
+        # --- Callback command ---
+        if self.callback_entry.get_text():
+            ipc_operation("CFG_SET", f"CFG:\n  CALLBACK_CMD: {self.callback_entry.get_text().strip()}")
 
-                # Apply other way-displays settings
-                subprocess.run(["way-displays", "--set", "MODE", name, w, h, hz])
-                if not vrr:
-                    subprocess.run(["way-displays", "--set", "VRR_OFF", name])
-                else:
-                    subprocess.run(["way-displays", "--delete", "VRR_OFF", name])
-                if not enabled:
-                    subprocess.run(["way-displays", "--set", "DISABLED", name])
-                else:
-                    subprocess.run(["way-displays", "--delete", "DISABLED", name])
-                if scale:
-                    if scale > 1:
-                        subprocess.run(["way-displays", "--set", "SCALE", name, f"{scale:.2f}"])
-                    else:
-                        subprocess.run(["way-displays", "--delete", "SCALE", name])
-
-        # --- Save arrangement + alignment ---
+        # --- Arrangement + alignment ---
         if self.layout_area:
             positions = {}
             transform_map = {
-                meta["name"]: meta.get("transform", "0")
+                meta["desc"]: meta.get("transform", "0")
                 for meta in self.layout_area.monitor_data.values()
             }
             for eventbox, meta in self.layout_area.monitor_data.items():
-                positions[meta["name"]] = {
+                positions[meta["desc"]] = {
                     "x": meta["x"],
                     "y": meta["y"],
                     "w": meta["width"],
@@ -1831,8 +1786,9 @@ class WayDisplaysApp(Gtk.Window):
                 if auto_arrange == "ROW"
                 else sorted(positions.keys(), key=lambda n: positions[n]["y"])
             )
-            print(f"sorted names: {sorted_names}")
             cfg["ORDER"] = sorted_names
+            print(sorted_names)
+            ipc_operation("CFG_SET", f"CFG:\n  ORDER:\n    - {sorted_names[0]}\n    - {sorted_names[1]}\n    - {sorted_names[2]}");
 
             # Use snapped value if available
             cfg["ARRANGE"] = auto_arrange
@@ -1842,27 +1798,24 @@ class WayDisplaysApp(Gtk.Window):
             # Alignment
             default_align = "TOP" if auto_arrange == "ROW" else "LEFT"
 
+            arrange = cfg["ARRANGE"]
+            align = cfg["ALIGN"]
+            ipc_operation("CFG_SET", f"CFG:\n  ARRANGE: {arrange}\n  ALIGN: {align}");
 
-        subprocess.run(["way-displays", "--set", "ARRANGE_ALIGN", cfg["ARRANGE"], cfg["ALIGN"]])
 
-        # --- Write back YAML ---
-        # --- DON'T REMOVE THIS -- IT'S NEEDED FOR OUR MONITOR POSITIONS TO APPLY
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w") as f:
-            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
-
-        subprocess.run(["way-displays", "--write"])
+        # --- Save config ---
+        ipc_operation("CFG_WRITE")
 
         GLib.timeout_add(250, self.reload_layout)
 
     def load_monitor_state(self):
-        if not os.path.exists(CONFIG_PATH):
-            print(f"Config file not found: {CONFIG_PATH}")
+        if not os.path.exists(SOCKET_PATH):
+            print(f"Config file not found: {SOCKET_PATH}")
             return {}
 
         try:
-            with open(CONFIG_PATH, "r") as f:
-                return yaml.safe_load(f) or {}
+            output = ipc_operation("GET")
+            return yaml.safe_load(yaml.safe_load(output)) or {}
 
         except yaml.YAMLError as e:
             print("Failed to parse YAML config:")
@@ -1871,10 +1824,7 @@ class WayDisplaysApp(Gtk.Window):
 
     def reload_layout(self):
         # Load updated config values
-        output = subprocess.check_output(
-            ["way-displays", "--yaml", "--get"],
-            timeout=3
-        ).decode()
+        output = ipc_operation("GET")
         data = yaml.safe_load(output)
         cfg = data.get("CFG", {})
 
@@ -1890,7 +1840,7 @@ class WayDisplaysApp(Gtk.Window):
             self.layout_frame.remove(child)
 
         # --- Update monitor dicts with fresh TRANSFORM ---
-        name_to_tab_index = {w.monitor["DESCRIPTION"]: i for i, w in enumerate(self.monitor_widgets)}
+        desc_to_tab_index = {w.monitor["DESCRIPTION"]: i for i, w in enumerate(self.monitor_widgets)}
         monitors_dicts = []
 
         for widget in self.monitor_widgets:
@@ -1901,7 +1851,7 @@ class WayDisplaysApp(Gtk.Window):
         self.layout_area = MonitorLayout(
             monitors=monitors_dicts,
             notebook=self.monitors_notebook,
-            name_to_tab_index=name_to_tab_index,
+            desc_to_tab_index=desc_to_tab_index,
             align=align,
             arrange=arrange,
             order=order,
