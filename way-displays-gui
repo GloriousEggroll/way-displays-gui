@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 
+from ctypes import CDLL
+CDLL('libgtk4-layer-shell.so')
+
 import gi
 import os
 import yaml
 import time
 import socket
 import math
+import cairo
 
 gi.require_version('Pango', '1.0')
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gtk, Gdk, Gio, GObject, GLib, Pango
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gtk, Gdk, Gio, GObject, Gtk4LayerShell, GLib, Pango
 
 SOCKET_PATH = os.path.expandvars("$XDG_RUNTIME_DIR/way-displays.$XDG_VTNR.sock")
 if not os.path.exists(SOCKET_PATH):
@@ -55,28 +60,50 @@ def get_config_data():
 
 get_config_data() # call once to store data upon opening app
 
+# more important hard to find docs
+# https://github.com/wmww/gtk4-layer-shell/blob/main/examples/simple-example.py
+# https://wmww.github.io/gtk4-layer-shell/gtk4-layer-shell-GTK4-Layer-Shell.html#gtk-layer-init-for-window
 class MonitorOverlay(Gtk.Window):
     def __init__(self, monitor, label_text):
         super().__init__()
-
-        self.set_resizable(False)
-        self.set_hide_on_close(False)
-        self.set_can_focus(False)
+        self.set_title("MonitorOverlay")
         self.set_decorated(False)
-        self.set_modal(False)
+        self.set_resizable(False)
+        self.set_focusable(False)
 
-        # Optional: bind to the monitor (will work under X11 and partially under Wayland)
-        if hasattr(self, "set_monitor"):
-            self.set_monitor(monitor)
+        # Init layer shell
+        Gtk4LayerShell.init_for_window(self)
 
-        # CSS styling
+        # Place it at the top layer (above everything)
+        Gtk4LayerShell.set_layer(self, Gtk4LayerShell.Layer.TOP)
+
+        # Pin to all edges (optional)
+        Gtk4LayerShell.set_anchor(self, Gtk4LayerShell.Edge.TOP, True)
+        Gtk4LayerShell.set_anchor(self, Gtk4LayerShell.Edge.LEFT, True)
+
+        # Click-through
+        Gtk4LayerShell.set_keyboard_mode(self, Gtk4LayerShell.KeyboardMode.NONE)
+
+        # Bind to specific monitor
+        display = Gdk.Display.get_default()
+        Gtk4LayerShell.set_monitor(self, monitor)
+
+        # Transparent background
+        self.set_name("overlay-window")
+
+        # CSS
         css = b"""
-        window.overlay-window {
+        window#overlay-window {
+            background-color: rgba(0, 0, 0, 0.0);  /* fully transparent */
+        }
+
+        .overlay-box {
             background-color: rgba(0, 0, 0, 0.85);
             border-radius: 10px;
             padding: 16px;
         }
-        label.overlay-label {
+
+        .overlay-label {
             color: white;
             font-size: 16pt;
             font-weight: bold;
@@ -85,47 +112,34 @@ class MonitorOverlay(Gtk.Window):
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
         Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
+            display,
             provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-        # Set style class
-        self.add_css_class("overlay-window")
+        # Build UI
+        overlay = Gtk.Overlay()
+        self.set_child(overlay)
+
+        label_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        label_box.add_css_class("overlay-box")
+        label_box.set_valign(Gtk.Align.CENTER)
+        label_box.set_halign(Gtk.Align.CENTER)
+
+        # Dynamically calculate 10% size of monitor
+        rect = monitor.get_geometry()
+        width = max(1, int(rect.width * 0.15))
+        height = max(1, int(rect.height * 0.15))
+
+        label_box.set_size_request(width, height)
 
         label = Gtk.Label(label=label_text)
         label.set_wrap(True)
-        label.set_wrap_mode(Pango.WrapMode.WORD)
-        label.set_justify(Gtk.Justification.CENTER)
-        label.set_halign(Gtk.Align.CENTER)
-        label.set_valign(Gtk.Align.CENTER)
+        label.set_wrap_mode(Gtk.WrapMode.WORD)
         label.add_css_class("overlay-label")
 
-        self.set_child(label)
-
-    def present_on_monitor(self, monitor):
-        geometry = monitor.get_geometry()
-        scale = monitor.get_scale_factor()
-
-        # Size of the overlay
-        overlay_width = 200
-        overlay_height = 80
-
-        # Position to center it on the monitor
-        x = geometry.x
-        y = geometry.y
-
-        # Set the size and position manually
-        self.set_default_size(overlay_width, overlay_height)
-        self.move(x, y)
-        self.fullscreen_on_monitor(monitor)
-        self.present()
-
-    def move(self, x, y):
-        surface = self.get_surface()
-        if surface:
-            surface.set_input_region(None)
-            surface.move(x, y)
+        label_box.append(label)
+        overlay.set_child(label_box)
 
 
 class MonitorWidget(Gtk.Box):
@@ -1119,11 +1133,6 @@ class MonitorLayout(Gtk.Fixed):
             GLib.idle_add(self.recenter_all_monitors)
             self.last_allocated_size = (new_w, new_h)
 
-    def _remove_overlay(self, overlay):
-        if overlay.get_parent():
-            self.remove(overlay)
-        return False
-
     def get_positions(self):
         return {
             data["desc"]: (data["x"], data["y"])
@@ -1180,8 +1189,12 @@ class MonitorLayout(Gtk.Fixed):
         if monitor:
             # Use your custom class
             label_text = f"{name}\n{orig_width}x{orig_height}"
-            overlay = MonitorOverlay(monitor, label_text)
-            overlay.present_on_monitor(monitor)
+            overlay = MonitorOverlay(monitor, f"{label_text}")
+            overlay.present()
+            # Click-through overlay.
+            # https://github.com/wmww/gtk4-layer-shell/issues/61#issuecomment-3092952852
+            overlay.get_surface().set_input_region(cairo.Region())
+
 
 class WayDisplaysApp(Gtk.ApplicationWindow):
     def __init__(self, application):
@@ -1739,13 +1752,9 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
         for rotatable, meta in self.layout_area.monitor_data.items():
             GLib.idle_add(
                 self.layout_area.show_overlay,
-                meta["desc"],
-                meta["width"],
-                meta["height"],
-                meta["x"],
-                meta["y"],
-                meta["orig_width"],
-                meta["orig_height"],
+                meta["desc"], meta["width"], meta["height"],
+                meta["x"], meta["y"],
+                meta["orig_width"], meta["orig_height"],
                 meta["name"]
             )
 
