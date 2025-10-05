@@ -10,6 +10,7 @@ import time
 import socket
 import math
 import cairo
+import copy
 
 gi.require_version('Pango', '1.0')
 gi.require_version("Gtk", "4.0")
@@ -64,7 +65,7 @@ get_config_data() # call once to store data upon opening app
 # https://github.com/wmww/gtk4-layer-shell/blob/main/examples/simple-example.py
 # https://wmww.github.io/gtk4-layer-shell/gtk4-layer-shell-GTK4-Layer-Shell.html#gtk-layer-init-for-window
 class MonitorOverlay(Gtk.Window):
-    def __init__(self, monitor, label_text):
+    def __init__(self, monitor, label_text, width, height):
         super().__init__()
         self.set_title("MonitorOverlay")
         self.set_decorated(False)
@@ -127,9 +128,8 @@ class MonitorOverlay(Gtk.Window):
         label_box.set_halign(Gtk.Align.CENTER)
 
         # Dynamically calculate 10% size of monitor
-        rect = monitor.get_geometry()
-        width = max(1, int(rect.width * 0.15))
-        height = max(1, int(rect.height * 0.15))
+        width = max(1, int(width * 0.15))
+        height = max(1, int(height * 0.15))
 
         label_box.set_size_request(width, height)
 
@@ -229,7 +229,7 @@ class MonitorWidget(Gtk.Box):
 
         self.rotation_buttons = {}
         rotations = [
-            ("None", "view-fullscreen-symbolic"),           # 0°
+            ("STANDARD", "view-fullscreen-symbolic"),           # 0°
             ("90", "object-rotate-right-symbolic"),         # 90°
             ("180", "view-refresh-symbolic"),               # 180°
             ("270", "object-rotate-left-symbolic"),         # 270°
@@ -252,6 +252,9 @@ class MonitorWidget(Gtk.Box):
                 background-color: #666;
                 border-radius: 4px;
             }
+            .rotate-0 {
+                transform: rotate(0deg);
+            }
             .rotate-90 {
                 transform: rotate(90deg);
             }
@@ -271,7 +274,7 @@ class MonitorWidget(Gtk.Box):
         for btn in self.rotation_group:
             btn.add_css_class("orientation-button")
 
-        self.rotation_buttons["None"].set_active(True)
+        self.rotation_buttons["STANDARD"].set_active(True)
 
         # ------------------ Flipped Toggle ------------------
         self.flip_switch = Gtk.Switch()
@@ -291,14 +294,14 @@ class MonitorWidget(Gtk.Box):
                 if "-" in transform:
                     rot = transform.split("-")[1].upper()
                 else:
-                    rot = "None"
+                    rot = "STANDARD"
             else:
                 rot = str(transform).upper()
 
             if rot in ["90", "180", "270"]:
                 self.rotation_buttons[rot].set_active(True)
             else:
-                self.rotation_buttons["None"].set_active(True)
+                self.rotation_buttons["STANDARD"].set_active(True)
 
         # ------------------ Scale Slider ------------------
         scale_value = monitor.get("CURRENT", {}).get("SCALE", 1.0)
@@ -383,7 +386,6 @@ class MonitorWidget(Gtk.Box):
 
 
     def _on_resolution_change(self, desc, new_width, new_height, refresh):
-        print(0)
         if not self.layout_area:
             return
         scale = 0.08
@@ -454,9 +456,6 @@ class MonitorWidget(Gtk.Box):
         flipped = False
         if hasattr(self, "flip_switch") and self.flip_switch:
             flipped = self.flip_switch.get_active()
-
-        if not rotation or rotation == "None":
-            return "FLIPPED" if flipped else None
 
         transform = rotation
         if flipped:
@@ -529,29 +528,34 @@ def parse_transform(transform_str):
         if "-" in transform_str:
             parts = transform_str.split("-")
             if len(parts) == 2 and parts[1].isdigit():
-                angle = int(parts[1])
+                angle = parts[1]
+                if "STANDARD" in angle:
+                    angle = 0
+                else:
+                    angle = int(parts[1])
+
     elif transform_str.isdigit():
         angle = int(transform_str)
 
     return angle % 360, is_flipped
 
 class MonitorLayout(Gtk.Fixed):
-    def __init__(self, monitors, notebook, desc_to_tab_index, align=None, arrange=None, order=None, transform_overrides=None):
+    def __init__(self, monitors, notebook, desc_to_tab_index, align=None, arrange=None, order=None, transform_overrides=None, app_ref=None):
         super().__init__()
+        self.app_ref = app_ref
         self.align = (align or "TOP").upper()
         self.arrange = (arrange or "ROW").upper()
         self.notebook = notebook
         self.desc_to_tab_index = desc_to_tab_index
         self.monitor_data = {}
         self.drag_data = {}
-
         self.set_size_request(1280, 720)
 
         # CSS Setup
         css = b"""
         .monitor-frame {
             background-color: #4a90e2;
-            border-radius: 6px;
+            border: 1px solid #ffffff;
         }
         .overlay-label {
             font-size: 10px;
@@ -562,21 +566,28 @@ class MonitorLayout(Gtk.Fixed):
             border-radius: 4px;
             transition: border 100ms ease-in-out;
         }
+
         .rotate-0 {
             transform: rotate(0deg);
+            transform-origin: center center;
         }
+
         .rotate-90 {
             transform: rotate(90deg);
+            transform-origin: top left;
         }
+
         .rotate-180 {
             transform: rotate(180deg);
+            transform-origin: center center;
         }
+
         .rotate-270 {
             transform: rotate(270deg);
+            transform-origin: top right;
         }
-        .flip-indicator {
-            margin-top: -12px;
-            margin-right: 4px;
+        .panel-bar {
+            background-color: rgba(0, 0, 255, 0.7); /* White at 70% opacity */
         }
         """
         provider = Gtk.CssProvider()
@@ -590,13 +601,12 @@ class MonitorLayout(Gtk.Fixed):
         # --- Config Loading ---
         self.transform_overrides = transform_overrides or {}
         config_order = []
-        if os.path.exists(SOCKET_PATH):
-            data = CONFIG_DATA
-            cfg = data.get("CFG", {})
-            self.align = (cfg.get("ALIGN", self.align)).upper()
-            self.arrange = (cfg.get("ARRANGE", self.arrange)).upper()
-            config_order = cfg.get("ORDER", [])
-            disabled = cfg.get("DISABLED", [])
+        data = CONFIG_DATA
+        cfg = data.get("CFG", {})
+        self.align = (cfg.get("ALIGN", self.align)).upper()
+        self.arrange = (cfg.get("ARRANGE", self.arrange)).upper()
+        config_order = cfg.get("ORDER", [])
+        disabled = cfg.get("DISABLED", [])
 
         order = order or config_order
         self._current_order = order
@@ -634,10 +644,8 @@ class MonitorLayout(Gtk.Fixed):
             transform = mon.get("DESIRED", {}).get("TRANSFORM", mon.get("CURRENT", {}).get("TRANSFORM", 0))
             transform_str = str(transform).upper()
             angle, is_flipped = parse_transform(transform_str)
-            if angle in (90, 270):
-                width, height = height, width
-
-            w, h = int(width * scale), int(height * scale)
+            rotated_w, rotated_h = rotated_dimensions(width, height, angle)
+            w, h = int(rotated_w * scale), int(rotated_h * scale)
 
             # === Label inside box ===
             label = Gtk.Label(label=name)
@@ -646,28 +654,90 @@ class MonitorLayout(Gtk.Fixed):
             label.set_max_width_chars(20)
             label.set_halign(Gtk.Align.CENTER)
             label.set_valign(Gtk.Align.CENTER)
+            label.set_hexpand(True)
+            label.set_vexpand(True)
+
+            # Flip Icons
+            flip_icon_t = Gtk.Image.new_from_icon_name("object-flip-horizontal-symbolic")
+            flip_icon_t.set_halign(Gtk.Align.CENTER)
+            flip_icon_t.set_valign(Gtk.Align.START)
+            flip_icon_t.set_name("flip-indicator")
+            flip_icon_t.add_css_class("flip-indicator")
+            flip_icon_t.set_visible(False)
+
+            flip_icon_b = Gtk.Image.new_from_icon_name("object-flip-horizontal-symbolic")
+            flip_icon_b.set_halign(Gtk.Align.CENTER)
+            flip_icon_b.set_valign(Gtk.Align.END)
+            flip_icon_b.set_name("flip-indicator")
+            flip_icon_b.add_css_class("flip-indicator")
+            flip_icon_b.set_visible(False)
+
+            if is_flipped:
+            # Flip indicator
+                if angle in (180, 270):
+                    flip_icon_t.set_visible(False)
+                    flip_icon_b.set_visible(True)
+                else:
+                    flip_icon_t.set_visible(True)
+                    flip_icon_b.set_visible(False)
+
+            # --- pane] bars ---
+            panel_bar_top = Gtk.Box()
+            panel_bar_top.set_size_request(-1, 10)  # Height = 3px, width = fill
+            panel_bar_top.set_halign(Gtk.Align.FILL)
+            panel_bar_top.set_valign(Gtk.Align.START)
+            panel_bar_top.set_hexpand(True)
+            panel_bar_top.set_vexpand(True)
+            panel_bar_top.add_css_class("panel-bar")  # Custom class for styling
+            panel_bar_top.set_visible(False)
+
+            panel_bar_bottom = Gtk.Box()
+            panel_bar_bottom.set_size_request(-1, 10)  # Height = 3px, width = fill
+            panel_bar_bottom.set_halign(Gtk.Align.FILL)
+            panel_bar_bottom.set_valign(Gtk.Align.END)
+            panel_bar_bottom.set_hexpand(True)
+            panel_bar_bottom.set_vexpand(True)
+            panel_bar_bottom.add_css_class("panel-bar")  # Custom class for styling
+            panel_bar_bottom.set_visible(False)
+
+            if angle in (180, 270):
+                panel_bar_top.set_visible(True)
+                panel_bar_bottom.set_visible(False)
+            else:
+                panel_bar_top.set_visible(False)
+                panel_bar_bottom.set_visible(True)
+
+            overlay = Gtk.Overlay()
+            overlay.set_halign(Gtk.Align.FILL)
+            overlay.set_valign(Gtk.Align.FILL)
+            overlay.set_hexpand(True)
+            overlay.set_vexpand(True)
+
+            # Overlay composition
+            overlay.set_child(label)
+            overlay.add_overlay(flip_icon_t)
+            overlay.add_overlay(flip_icon_b)
+            overlay.add_overlay(panel_bar_top)
+            overlay.add_overlay(panel_bar_bottom)
 
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             box.set_halign(Gtk.Align.FILL)
             box.set_valign(Gtk.Align.FILL)
-            box.add_css_class("monitor-frame")
-            box.append(label)
-
-            frame = Gtk.Frame()
-            frame.set_child(box)
-            frame.set_size_request(w, h)
+            box.append(overlay)
 
             # === OUTER ROTATABLE CONTAINER ===
             rotatable = Gtk.Box()
             rotatable.set_halign(Gtk.Align.START)
             rotatable.set_valign(Gtk.Align.START)
+            rotatable.add_css_class("monitor-frame")
             rotatable.set_size_request(w, h)
-            rotatable.append(frame)
+            rotatable.append(box)
 
             # === Gesture support in GTK 4 ===
             gesture_click = Gtk.GestureClick()
             gesture_click.connect("pressed", self.on_shape_clicked, rotatable, desc)
             rotatable.add_controller(gesture_click)
+
 
             gesture_drag = Gtk.GestureDrag()
             gesture_drag.connect("drag-begin", self.on_drag_begin, rotatable)
@@ -689,10 +759,13 @@ class MonitorLayout(Gtk.Fixed):
                 "orig_height": height,
                 "order": order,
                 "transform": transform,
-                "frame": frame,
                 "box": box,
+                "flip_icon_b": flip_icon_b,
+                "flip_icon_t": flip_icon_t,
+                "label": label,
+                "panel_bar_top": panel_bar_top,
+                "panel_bar_bottom": panel_bar_bottom,
             }
-
 
         # --- Position monitors ---
         layout_w, layout_h = 1280, 720
@@ -832,40 +905,55 @@ class MonitorLayout(Gtk.Fixed):
     def _apply_transform_to_shape(self, rotatable, transform):
         meta = self.monitor_data[rotatable]
         box = meta.get("box")
-
-        for child in list(box):
-            if isinstance(child, Gtk.Image) and child.get_name() == "flip-indicator":
-                box.remove(child)
+        overlay = meta.get("overlay")
+        desc = meta.get("desc")
+        width = meta.get("width")
+        height = meta.get("height")
+        flip_icon_b = meta.get("flip_icon_b")
+        flip_icon_t = meta.get("flip_icon_t")
+        box_label = meta.get("label")
+        panel_bar_top = meta.get("panel_bar_top")
+        panel_bar_bottom = meta.get("panel_bar_bottom")
 
         angle, is_flipped = parse_transform(transform)
 
-        # CSS classes for rotation
-        for cls in ["rotate-0", "rotate-90", "rotate-180", "rotate-270"]:
-            rotatable.remove_css_class(cls)
+        rotatable_classes = rotatable.get_css_classes()
+        for rclass in rotatable_classes:
+            if "rotate-" in rclass:
+                rotatable.remove_css_class(rclass)
 
-        # Reset to 0
-        rotatable.add_css_class("rotate-0")
+        if angle in (90, 270):
+            rotatable.add_css_class("vertical")
+            width, height = height, width
+        else:
+            rotatable.add_css_class("horizontal")
 
-        # Reset again so we dont get stacked transforms
-        rotatable.remove_css_class("rotate-0")
+        rotatable.set_size_request(width, height)
+        if angle in (180, 270):
+            panel_bar_top.set_visible(True)
+            panel_bar_bottom.set_visible(False)
+        else:
+            panel_bar_top.set_visible(False)
+            panel_bar_bottom.set_visible(True)
+        #rotatable.add_css_class(f"rotate-{angle}")
 
-        if angle == 90:
-            rotatable.add_css_class("rotate-90")
-        elif angle == 180:
-            rotatable.add_css_class("rotate-180")
-        elif angle == 270:
-            rotatable.add_css_class("rotate-270")
+        flip_icon_b.set_visible(False)
+        flip_icon_t.set_visible(False)
 
-        # Flip indicator
         if is_flipped:
-            flip_icon = Gtk.Image.new_from_icon_name("object-flip-vertical-symbolic")
-            flip_icon.set_halign(Gtk.Align.END)
-            flip_icon.set_valign(Gtk.Align.FILL)
-            flip_icon.set_vexpand(True)
-            flip_icon.set_name("flip-indicator")
-            flip_icon.add_css_class("flip-indicator")
-            flip_icon.is_flip_icon = True
-            box.append(flip_icon)
+        # Flip indicator
+            if angle in (180, 270):
+                flip_icon_t.set_visible(False)
+                flip_icon_b.set_visible(True)
+            else:
+                flip_icon_t.set_visible(True)
+                flip_icon_b.set_visible(False)
+
+
+
+
+        self.recenter_all_monitors()
+        self._snap_monitors_to_edges()
 
     def add_monitor(self, monitor):
         desc = monitor["DESCRIPTION"]
@@ -887,40 +975,97 @@ class MonitorLayout(Gtk.Fixed):
         # Apply initial transform (rotate width/height if needed)
         angle, is_flipped = parse_transform(str(transform).upper())
         orig_width, orig_height = width, height
-        if angle in (90, 270):
-            width, height = height, width
+        rotated_w, rotated_h = rotated_dimensions(width, height, angle)
 
         # --- Scaled sizes ---
         scale = 0.08
-        w, h = int(width * scale), int(height * scale)
+        w, h = int(rotated_w * scale), int(rotated_h * scale)
 
-        # --- Visual frame ---
-        frame = Gtk.Frame()
-        frame.set_size_request(w, h)
-        frame.add_css_class("monitor-frame")
-
-        # Inner content box
+        # === Label inside box ===
         label = Gtk.Label(label=name)
-        label.set_justify(Gtk.Justification.CENTER)
+        label.set_wrap(True)
+        label.set_wrap_mode(Pango.WrapMode.WORD)
+        label.set_max_width_chars(20)
+        label.set_halign(Gtk.Align.CENTER)
+        label.set_valign(Gtk.Align.CENTER)
+        label.set_hexpand(True)
+        label.set_vexpand(True)
+
+        # Flip Icons
+        flip_icon_t = Gtk.Image.new_from_icon_name("object-flip-horizontal-symbolic")
+        flip_icon_t.set_halign(Gtk.Align.CENTER)
+        flip_icon_t.set_valign(Gtk.Align.START)
+        flip_icon_t.set_name("flip-indicator")
+        flip_icon_t.add_css_class("flip-indicator")
+        flip_icon_t.set_visible(False)
+
+        flip_icon_b = Gtk.Image.new_from_icon_name("object-flip-horizontal-symbolic")
+        flip_icon_b.set_halign(Gtk.Align.CENTER)
+        flip_icon_b.set_valign(Gtk.Align.END)
+        flip_icon_b.set_name("flip-indicator")
+        flip_icon_b.add_css_class("flip-indicator")
+        flip_icon_b.set_visible(False)
+
+        if is_flipped:
+        # Flip indicator
+            if angle in (180, 270):
+                flip_icon_t.set_visible(False)
+                flip_icon_b.set_visible(True)
+            else:
+                flip_icon_t.set_visible(True)
+                flip_icon_b.set_visible(False)
+
+        # --- pane] bars ---
+        panel_bar_top = Gtk.Box()
+        panel_bar_top.set_size_request(-1, 10)  # Height = 3px, width = fill
+        panel_bar_top.set_halign(Gtk.Align.FILL)
+        panel_bar_top.set_valign(Gtk.Align.START)
+        panel_bar_top.set_hexpand(True)
+        panel_bar_top.set_vexpand(True)
+        panel_bar_top.add_css_class("panel-bar")  # Custom class for styling
+        panel_bar_top.set_visible(False)
+
+        panel_bar_bottom = Gtk.Box()
+        panel_bar_bottom.set_size_request(-1, 10)  # Height = 3px, width = fill
+        panel_bar_bottom.set_halign(Gtk.Align.FILL)
+        panel_bar_bottom.set_valign(Gtk.Align.END)
+        panel_bar_bottom.set_hexpand(True)
+        panel_bar_bottom.set_vexpand(True)
+        panel_bar_bottom.add_css_class("panel-bar")  # Custom class for styling
+        panel_bar_bottom.set_visible(False)
+
+        if angle in (180, 270):
+            panel_bar_top.set_visible(True)
+            panel_bar_bottom.set_visible(False)
+        else:
+            panel_bar_top.set_visible(False)
+            panel_bar_bottom.set_visible(True)
+
+        overlay = Gtk.Overlay()
+        overlay.set_halign(Gtk.Align.FILL)
+        overlay.set_valign(Gtk.Align.FILL)
+        overlay.set_hexpand(True)
+        overlay.set_vexpand(True)
+
+        # Overlay composition
+        overlay.set_child(label)
+        overlay.add_overlay(flip_icon_t)
+        overlay.add_overlay(flip_icon_b)
+        overlay.add_overlay(panel_bar_top)
+        overlay.add_overlay(panel_bar_bottom)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.set_halign(Gtk.Align.FILL)
         box.set_valign(Gtk.Align.FILL)
-        box.set_hexpand(True)
-        box.set_vexpand(True)
-        box.append(label)
-        frame.set_child(box)
+        box.append(overlay)
 
-        # --- Rotation container ---
+        # === OUTER ROTATABLE CONTAINER ===
         rotatable = Gtk.Box()
         rotatable.set_halign(Gtk.Align.START)
         rotatable.set_valign(Gtk.Align.START)
-        rotatable.append(frame)
-
-        # Apply rotation classes
-        for cls in ["rotate-0", "rotate-90", "rotate-180", "rotate-270"]:
-            rotatable.remove_css_class(cls)
-        rotatable.add_css_class(f"rotate-{angle}")
+        rotatable.add_css_class("monitor-frame")
+        rotatable.set_size_request(w, h)
+        rotatable.append(box)
 
         # --- Event handling (drag + click) ---
         gesture_click = Gtk.GestureClick()
@@ -965,10 +1110,12 @@ class MonitorLayout(Gtk.Fixed):
             "y": y,
             "transform": transform,
             "box": box,
+            "flip_icon_b": flip_icon_b,
+            "flip_icon_t": flip_icon_t,
             "label": label,
-            "frame": frame,
+            "panel_bar_top": panel_bar_top,
+            "panel_bar_bottom": panel_bar_bottom,
         }
-
 
     def remove_monitor(self, desc):
         for rotatable, data in list(self.monitor_data.items()):
@@ -1015,11 +1162,15 @@ class MonitorLayout(Gtk.Fixed):
         if not self.monitor_data:
             return
 
-        layout_width = self.get_allocated_width()
-        layout_height = self.get_allocated_height()
+        data = CONFIG_DATA
+        cfg = data.get("CFG", {})
 
-        arrange = getattr(self, "_current_arrange", "ROW").upper()
-        align = getattr(self, "_current_align", "TOP").upper()
+
+        layout_width = self.get_width()
+        layout_height = self.get_height()
+
+        arrange = cfg.get("ARRANGE", "ROW")
+        align = cfg.get("ALIGN", "TOP")
 
         widgets = list(self.monitor_data.items())
 
@@ -1027,7 +1178,7 @@ class MonitorLayout(Gtk.Fixed):
             rotated_widgets = []
             total_width = 0
             for widget, data in widgets:
-                transform = data.get("CURRENT", {}).get("TRANSFORM")
+                transform = data.get("CURRENT", {}).get("TRANSFORM", 0)
                 w, h = rotated_dimensions(data["width"], data["height"], transform)
                 total_width += w
                 rotated_widgets.append((widget, w, h))
@@ -1073,7 +1224,7 @@ class MonitorLayout(Gtk.Fixed):
             rotated_widgets = []
             total_height = 0
             for widget, data in widgets:
-                transform = data.get("CURRENT", {}).get("TRANSFORM")
+                transform = data.get("CURRENT", {}).get("TRANSFORM", 0)
                 w, h = rotated_dimensions(data["width"], data["height"], transform)
                 total_height += h
                 rotated_widgets.append((widget, w, h))
@@ -1148,6 +1299,8 @@ class MonitorLayout(Gtk.Fixed):
         cfg = data.get("CFG", {})
         order = cfg.get("ORDER", [])
         disabled = cfg.get("DISABLED", [])
+        transform = cfg.get("TRANSFORM", [])
+        angle, is_flipped = parse_transform(str(transform))
         monitor = None
 
         # Get the default display
@@ -1189,11 +1342,13 @@ class MonitorLayout(Gtk.Fixed):
         if monitor:
             # Use your custom class
             label_text = f"{name}\n{orig_width}x{orig_height}"
-            overlay = MonitorOverlay(monitor, f"{label_text}")
+            overlay = MonitorOverlay(monitor, f"{label_text}", orig_width, orig_height)
             overlay.present()
             # Click-through overlay.
             # https://github.com/wmww/gtk4-layer-shell/issues/61#issuecomment-3092952852
             overlay.get_surface().set_input_region(cairo.Region())
+            if self.app_ref and hasattr(self.app_ref, "overlays"):
+                self.app_ref.overlays.append(overlay)
 
 
 class WayDisplaysApp(Gtk.ApplicationWindow):
@@ -1203,7 +1358,7 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
         self.set_default_size(1280, 1000)
         self.set_resizable(True)
         self.set_decorated(True)
-
+        self.overlays = []
         # === HeaderBar ===
         header = Gtk.HeaderBar()
         header.set_title_widget(Gtk.Label(label="Way Displays GUI"))
@@ -1362,7 +1517,7 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             # Config TRANSFORM
             for entry in cfg.get("TRANSFORM", []):
                 if isinstance(entry, dict) and entry.get("DESCRIPTION") == desc:
-                    mon.setdefault("CURRENT", {})["TRANSFORM"] = entry.get("TRANSFORM")
+                    mon.setdefault("CURRENT", {})["TRANSFORM"] = entry.get("TRANSFORM", 0)
 
             # Config SCALE
             for entry in cfg.get("SCALE", []):
@@ -1398,7 +1553,6 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             widget.app = self
             self.monitor_widgets.append(widget)
 
-
             make = mon.get("MAKE")
             model = mon.get("MODEL")
             name = mon.get("NAME")
@@ -1423,7 +1577,8 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             self.monitors_notebook,
             self.monitor_tab_indices,
             align=align_setting,
-            arrange=arrange
+            arrange=arrange,
+            app_ref=self
         )
 
         # Apply transforms to layout
@@ -1531,17 +1686,14 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
                 current_w = data["width"]
                 current_h = data["height"]
 
-                if new_transform and ("90" in new_transform or "270" in new_transform):
-                    data["width"], data["height"] = current_h, current_w
-                else:
-                    # fallback: use current tab to re-fetch base mode dimensions
-                    tab_widget = self.monitor_tabs.get(desc, (None,))[0]
-                    if tab_widget:
-                        state = tab_widget.get_desired_state()
-                        scale = 0.08
-                        if state:
-                            data["width"] = int(state["width"] * scale)
-                            data["height"] = int(state["height"] * scale)
+                # fallback: use current tab to re-fetch base mode dimensions
+                tab_widget = self.monitor_tabs.get(desc, (None,))[0]
+                if tab_widget:
+                    state = tab_widget.get_desired_state()
+                    scale = 0.08
+                    if state:
+                        data["width"] = int(state["width"] * scale)
+                        data["height"] = int(state["height"] * scale)
 
                 break
 
@@ -1566,23 +1718,33 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             self.layout_area.add_monitor(monitor)
             self.layout_area.remove_monitor(desc)
 
+    def extract_empty_entries(self, cfg):
+        """Extracts empty lists from cfg into a flat dict (no nested CFG)."""
+        empty_cfg = {}
+        for key, value in cfg.items():
+            if isinstance(value, list) and not value:
+                empty_cfg[key] = value
+        return empty_cfg
+
     def save_config(self, button=None):
         data = CONFIG_DATA
         cfg = data.get("CFG", {})
+        del_cfg = {}
 
-        cfg.setdefault("MODE", [])
+        def upsert_entry(lst, desc_key, desc_value):
+            for entry in lst:
+                if isinstance(entry, dict) and entry.get(desc_key) == desc_value:
+                    return entry
+            new_entry = {desc_key: desc_value}
+            lst.append(new_entry)
+            return new_entry
+
         cfg.setdefault("SCALE", [])
         cfg.setdefault("VRR_OFF", [])
-        cfg.setdefault("DISABLED", [])
         cfg.setdefault("TRANSFORM", [])
+        cfg.setdefault("DISABLED", [])
 
-        def upsert_entry(lst, desc_key, desc_value, key, value):
-            for entry in lst:
-                if isinstance(entry, dict) and (entry.get("DESCRIPTION") == desc_value):
-                    entry[key] = value
-                    return
-            lst.append({desc_key: desc_value, key: value})
-
+        # first handle changes/enablements
         for widget in self.monitor_widgets:
             if isinstance(widget, MonitorWidget):
                 state = widget.get_desired_state()
@@ -1597,31 +1759,132 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
                 vrr = state["vrr"]
                 scale = state["scale"]
                 transform = state.get("transform")
+                callback = self.callback_entry.get_text()
 
-                upsert_entry(cfg["MODE"], "DESCRIPTION", desc, "WIDTH", int(w))
-                upsert_entry(cfg["MODE"], "DESCRIPTION", desc, "HEIGHT", int(h))
-                upsert_entry(cfg["MODE"], "DESCRIPTION", desc, "HZ", int(hz))
-                upsert_entry(cfg["SCALE"], "DESCRIPTION", desc, "SCALE", float(scale))
-                upsert_entry(cfg["TRANSFORM"], "DESCRIPTION", desc, "TRANSFORM", transform)
+                # --- MODE ---
+                if w and h and hz:
+                    entry = upsert_entry(cfg["MODE"], "NAME_DESC", desc)
+                    entry["WIDTH"] = int(w)
+                    entry["HEIGHT"] = int(h)
+                    entry["HZ"] = int(hz)
 
-                ipc_operation("CFG_SET", f"CFG:\n  MODE:\n    - NAME_DESC: {desc}\n      WIDTH: {w}\n      HEIGHT: {h}\n      HZ: {hz}")
-                ipc_operation("CFG_SET", f"CFG:\n  VRR_OFF:\n    - {desc}") if not vrr else ipc_operation("CFG_DEL", f"CFG:\n  VRR_OFF:\n    - {desc}")
-                ipc_operation("CFG_SET", f"CFG:\n  DISABLED:\n    - {desc}") if not enabled else ipc_operation("CFG_DEL", f"CFG:\n  DISABLED:\n    - {desc}")
-
-                if scale:
-                    if scale > 1:
-                        ipc_operation("CFG_SET", f"CFG:\n  SCALE:\n    - NAME_DESC: {desc}\n      SCALE: {scale:.2f}")
+                # --- VRR_OFF ---
+                if cfg.get("VRR_OFF"):
+                    if desc in cfg["VRR_OFF"]:
+                        if vrr:
+                            cfg["VRR_OFF"] = [d for d in cfg["VRR_OFF"] if d != desc]
                     else:
-                        ipc_operation("CFG_DEL", f"CFG:\n  SCALE:\n    - NAME_DESC: {desc}\n      SCALE: 0")
+                        if not vrr:
+                            cfg.setdefault("VRR_OFF", []).append(desc)
 
+                # --- SCALE ---
+                if scale:
+                    entry = upsert_entry(cfg.setdefault("SCALE", []), "NAME_DESC", desc)
+                    entry["SCALE"] = float(scale)
+
+                # --- TRANSFORM ---
                 if transform:
-                    ipc_operation("CFG_SET", f"CFG:\n  TRANSFORM:\n    - NAME_DESC: {desc}\n      TRANSFORM: {transform}")
+                    if "STANDARD" in transform and "FLIPPED" not in transform:
+                        if cfg.get("TRANSFORM"):
+                            found_transform = any(entry.get("NAME_DESC") == desc for entry in cfg["TRANSFORM"])
+                            if found_transform:
+                                cfg["TRANSFORM"] = [
+                                    entry for entry in cfg["TRANSFORM"]
+                                    if entry.get("NAME_DESC") != desc
+                                ]
+                    else:
+                        if "FLIPPED-STANDARD" in transform:
+                            transform = "FLIPPED"
+                        entry = upsert_entry(cfg.setdefault("TRANSFORM", []), "NAME_DESC", desc)
+                        entry["TRANSFORM"] = transform
+
+                # --- DISABLED ---
+                if cfg.get("DISABLED"):
+                    if desc in cfg["DISABLED"]:
+                        if enabled:
+                            cfg["DISABLED"] = [d for d in cfg["DISABLED"] if d != desc]
+                    else:
+                        if not enabled:
+                            cfg.setdefault("DISABLED", []).append(desc)
+
+                # --- CALLBACK_CMD ---
+                if self.callback_entry.get_text() == "\"\"" or self.callback_entry.get_text() == "''":
+                    cfg["CALLBACK_CMD"] = []
                 else:
-                    ipc_operation("CFG_DEL", f"CFG:\n  TRANSFORM:\n    - NAME_DESC: {desc}\n      TRANSFORM: 90")
+                    cfg["CALLBACK_CMD"] = self.callback_entry.get_text()
 
 
-        if self.callback_entry.get_text():
-            ipc_operation("CFG_DEL", f"CFG:\n  CALLBACK_CMD: \"\"")
+                #ipc_operation("CFG_SET", f"CFG:\n  MODE:\n    - NAME_DESC: {desc}\n      WIDTH: {w}\n      HEIGHT: {h}\n      HZ: {hz}")
+                #ipc_operation("CFG_SET", f"CFG:\n  VRR_OFF:\n    - {desc}") if not vrr else ipc_operation("CFG_DEL", f"CFG:\n  VRR_OFF:\n    - {desc}")
+                #ipc_operation("CFG_SET", f"CFG:\n  DISABLED:\n    - {desc}") if not enabled else ipc_operation("CFG_DEL", f"CFG:\n  DISABLED:\n    - {desc}")
+
+                #if scale:
+                #    if scale > 1:
+                #        ipc_operation("CFG_SET", f"CFG:\n  SCALE:\n    - NAME_DESC: {desc}\n      SCALE: {scale:.2f}")
+                #    else:
+                #        ipc_operation("CFG_DEL", f"CFG:\n  SCALE:\n    - NAME_DESC: {desc}\n      SCALE: 0")
+
+                #if transform:
+                #    ipc_operation("CFG_SET", f"CFG:\n  TRANSFORM:\n    - NAME_DESC: {desc}\n      TRANSFORM: {transform}")
+                #else:
+                #    ipc_operation("CFG_DEL", f"CFG:\n  TRANSFORM:\n    - NAME_DESC: {desc}\n      TRANSFORM: 90")
+        # Now we need to handle anything that was removed in a separate delete list
+        # copy empty values from set to DEL
+        empties = self.extract_empty_entries(cfg)
+        del_cfg = copy.deepcopy(empties)
+
+        del_cfg.setdefault("VRR_OFF", [])
+        del_cfg.setdefault("TRANSFORM", [])
+        del_cfg.setdefault("DISABLED", [])
+
+        # first handle changes/enablements
+        for widget in self.monitor_widgets:
+            if isinstance(widget, MonitorWidget):
+                state = widget.get_desired_state()
+                if not state:
+                    continue
+
+                desc = state["desc"]
+                transform = state.get("transform")
+
+                # --- TRANSFORM ---
+                if transform:
+                    if cfg.get("TRANSFORM"):
+                        if "STANDARD" in transform and "FLIPPED" not in transform:
+                            entry = upsert_entry(del_cfg.setdefault("TRANSFORM", []), "NAME_DESC", desc)
+                            entry["TRANSFORM"] = 90
+                    # empty check
+                    elif "TRANSFORM" in del_cfg:
+                        entry = upsert_entry(del_cfg.setdefault("TRANSFORM", []), "NAME_DESC", desc)
+                        entry["TRANSFORM"] = 90
+
+                # --- VRR_OFF ---
+                if cfg.get("VRR_OFF"):
+                    # VRR_OFF is a list of descriptions, so direct check works
+                    if desc not in cfg["VRR_OFF"]:
+                        del_cfg.setdefault("VRR_OFF", []).append(desc)
+                # empty check
+                elif "VRR_OFF" in del_cfg:
+                    del_cfg.setdefault("VRR_OFF", []).append(desc)
+
+                # --- DISABLED ---
+                if cfg.get("DISABLED"):
+                    if desc not in cfg["DISABLED"]:
+                        del_cfg.setdefault("DISABLED", []).append(desc)
+                # empty check
+                elif "DISABLED" in del_cfg:
+                    del_cfg.setdefault("DISABLED", []).append(desc)
+
+                # --- CALLBACK_CMD ---
+                if "CALLBACK_CMD" in del_cfg:
+                    del_cfg["CALLBACK_CMD"] = "\"\""
+
+
+
+        # Now remove the empty values from both lists
+        cfg = {k: v for k, v in cfg.items() if v != []}
+        del_cfg = {k: v for k, v in del_cfg.items() if v != []}
+
 
         if self.layout_area:
             positions = {}
@@ -1697,11 +1960,19 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
                 else sorted(positions.keys(), key=lambda n: positions[n]["y"])
             )
             cfg["ORDER"] = sorted_names
-            ipc_operation("CFG_SET", f"CFG:\n  ORDER:\n    - " + "\n    - ".join(sorted_names))
+            #ipc_operation("CFG_SET", f"CFG:\n  ORDER:\n    - " + "\n    - ".join(sorted_names))
             cfg["ARRANGE"] = auto_arrange
             self.arrange_mode = cfg["ARRANGE"]
-            ipc_operation("CFG_SET", f"CFG:\n  ARRANGE: {cfg['ARRANGE']}\n  ALIGN: {cfg['ALIGN']}")
+            #ipc_operation("CFG_SET", f"CFG:\n  ARRANGE: {cfg['ARRANGE']}\n  ALIGN: {cfg['ALIGN']}")
 
+        print("SET")
+        print(yaml.dump(dict(CFG = cfg)))
+
+        print("DEL")
+        print(yaml.dump(dict(CFG = del_cfg)))
+
+        ipc_operation("CFG_DEL", yaml.dump(dict(CFG = del_cfg)))
+        ipc_operation("CFG_SET", yaml.dump(dict(CFG = cfg)))
         ipc_operation("CFG_WRITE")
         get_config_data()
         GLib.timeout_add(250, self.reload_layout)
@@ -1740,13 +2011,27 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             arrange=arrange,
             order=order,
             transform_overrides=transform_overrides,
+            app_ref=self
         )
+
+        for rotatable, meta in self.layout_area.monitor_data.items():
+            transform_val = transform_overrides.get(meta["desc"], 0)
+            angle, is_flipped = parse_transform(str(transform_val))
+
+            # Set icon visibility based on is_flipped
+            if "flip_icon" in meta:
+                meta["flip_icon"].set_visible(is_flipped)
 
         self.layout_frame.set_child(self.layout_area)
 
         # propagate new layout_area to all monitor widgets:
         for widget in self.monitor_widgets:
             widget.layout_area = self.layout_area
+
+        # --- CLEAR EXISTING OVERLAYS ---
+        for overlay in self.overlays:
+            overlay.destroy()
+        self.overlays = []
 
         # 👉 SHOW OVERLAY FOR ALL MONITORS
         for rotatable, meta in self.layout_area.monitor_data.items():
@@ -1755,7 +2040,8 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
                 meta["desc"], meta["width"], meta["height"],
                 meta["x"], meta["y"],
                 meta["orig_width"], meta["orig_height"],
-                meta["name"]
+                meta["name"],
+                app_ref=self
             )
 
 class MainApp(Gtk.Application):
