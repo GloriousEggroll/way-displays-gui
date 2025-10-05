@@ -65,7 +65,7 @@ get_config_data() # call once to store data upon opening app
 # https://github.com/wmww/gtk4-layer-shell/blob/main/examples/simple-example.py
 # https://wmww.github.io/gtk4-layer-shell/gtk4-layer-shell-GTK4-Layer-Shell.html#gtk-layer-init-for-window
 class MonitorOverlay(Gtk.Window):
-    def __init__(self, monitor, label_text, width, height):
+    def __init__(self, monitor, label_text, device, width, height, angle):
         super().__init__()
         self.set_title("MonitorOverlay")
         self.set_decorated(False)
@@ -102,9 +102,20 @@ class MonitorOverlay(Gtk.Window):
             background-color: rgba(0, 0, 0, 0.85);
             border-radius: 10px;
             padding: 16px;
+            border: 1px solid white;
         }
 
-        .overlay-label {
+        .connector-label {
+            color: white;
+            font-size: 40pt;
+            font-weight: bold;
+        }
+        .resolution-label {
+            color: white;
+            font-size: 30pt;
+            font-weight: bold;
+        }
+        .device-label {
             color: white;
             font-size: 16pt;
             font-weight: bold;
@@ -122,33 +133,85 @@ class MonitorOverlay(Gtk.Window):
         overlay = Gtk.Overlay()
         self.set_child(overlay)
 
+
+        overlay_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        overlay_box.add_css_class("overlay-box")
+        overlay_box.set_valign(Gtk.Align.CENTER)
+        overlay_box.set_halign(Gtk.Align.CENTER)
+        overlay_box.set_vexpand(False)
+        overlay_box.set_hexpand(False)
+
+        content_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        content_box.set_valign(Gtk.Align.CENTER)
+        content_box.set_halign(Gtk.Align.FILL)
+        content_box.set_vexpand(True)
+        content_box.set_hexpand(True)
+
         label_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        label_box.add_css_class("overlay-box")
         label_box.set_valign(Gtk.Align.CENTER)
-        label_box.set_halign(Gtk.Align.CENTER)
+        label_box.set_halign(Gtk.Align.FILL)
+        label_box.set_vexpand(False)
+        label_box.set_hexpand(True)
+
+        label_connector = Gtk.Label(label=label_text)
+        label_connector.add_css_class("connector-label")
+        label_connector.set_wrap(True)
+        label_connector.set_wrap_mode(Pango.WrapMode.WORD)
+        label_connector.set_max_width_chars(20)
+        label_connector.set_halign(Gtk.Align.CENTER)
+        label_connector.set_valign(Gtk.Align.CENTER)
+        label_connector.set_hexpand(False)
+        label_connector.set_vexpand(False)
+
+        label_resolution = Gtk.Label(label=f"{width}x{height}")
+        if angle in (90, 270):
+            label_resolution = Gtk.Label(label=f"{height}x{width}")
+        label_resolution.add_css_class("resolution-label")
+        label_resolution.set_wrap(True)
+        label_resolution.set_wrap_mode(Pango.WrapMode.WORD)
+        label_resolution.set_max_width_chars(20)
+        label_resolution.set_halign(Gtk.Align.CENTER)
+        label_resolution.set_valign(Gtk.Align.CENTER)
+        label_resolution.set_hexpand(False)
+        label_resolution.set_vexpand(False)
+
+
+        device = device.replace(f" ({label_text})", "")
+        device = f"({device})"
+        label_device = Gtk.Label(label=device)
+        label_device.add_css_class("device-label")
+        label_device.set_wrap(True)
+        label_device.set_wrap_mode(Pango.WrapMode.WORD)
+        label_device.set_max_width_chars(20)
+        label_device.set_halign(Gtk.Align.CENTER)
+        label_device.set_valign(Gtk.Align.CENTER)
+        label_device.set_hexpand(False)
+        label_device.set_vexpand(False)
+
+        label_box.append(label_connector)
+        label_box.append(label_resolution)
+        label_box.append(label_device)
+        content_box.append(label_box)
+        overlay_box.append(content_box)
+        overlay.set_child(overlay_box)
 
         # Dynamically calculate 10% size of monitor
+
         width = max(1, int(width * 0.15))
         height = max(1, int(height * 0.15))
-
-        label_box.set_size_request(width, height)
-
-        label = Gtk.Label(label=label_text)
-        label.set_wrap(True)
-        label.set_wrap_mode(Gtk.WrapMode.WORD)
-        label.add_css_class("overlay-label")
-
-        label_box.append(label)
-        overlay.set_child(label_box)
+        overlay_box.set_size_request(width, height)
 
 
 class MonitorWidget(Gtk.Box):
-    def __init__(self, monitor, on_enabled_toggle=None, on_transform_change=None, on_resolution_change=None, layout_area=None):
+    def __init__(self, monitor, on_enabled_toggle=None, on_transform_change=None, on_resolution_change=None, layout_area=None, apply_active=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self._on_resolution_change = on_resolution_change
+        self.on_monitor_toggle_changed = apply_active
         self.monitor = monitor
         self.set_margin_top(12)
         self.set_margin_bottom(12)
+        self.set_margin_start(12)
+        self.set_margin_end(12)
         self._on_transform_change = on_transform_change
         self.flip_switch = None
         self.layout_area = layout_area
@@ -196,14 +259,25 @@ class MonitorWidget(Gtk.Box):
         self.res_combo.set_halign(Gtk.Align.START)
         self.append(self.res_combo)
 
+        self.res_combo.connect("notify::selected", self.on_resolution_changed)
+        self.res_combo.connect("notify::selected", self.on_monitor_toggle_changed)
+
+
         # ------------------ Enabled Switch ------------------
         enabled = monitor.get('CURRENT', {}).get('ENABLED')
         self.enable_switch = Gtk.Switch()
         self.enable_switch.set_active(enabled)
         self.enable_switch.connect("notify::active", self._on_enabled_toggled)
+        self.enable_switch.connect("notify::active", self.on_monitor_toggle_changed)
         self._on_enabled_toggle = on_enabled_toggle
 
-        self.append(Gtk.Label(label="Enabled"))
+        enabled_label = Gtk.Label(label="Enabled")
+        enabled_label.set_wrap(False)
+        enabled_label.set_halign(Gtk.Align.START)
+        enabled_label.set_valign(Gtk.Align.START)
+        enabled_label.set_hexpand(True)
+        enabled_label.set_vexpand(True)
+        self.append(enabled_label)
 
         align_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         align_box.set_halign(Gtk.Align.START)
@@ -214,7 +288,15 @@ class MonitorWidget(Gtk.Box):
         vrr_state = monitor.get('CURRENT', {}).get('VRR', False)
         self.vrr_switch = Gtk.Switch()
         self.vrr_switch.set_active(vrr_state)
-        self.append(Gtk.Label(label="Adaptive Sync (VRR)"))
+        self.vrr_switch.connect("notify::active", self.on_monitor_toggle_changed)
+
+        vrr_label = Gtk.Label(label="Adaptive Sync (VRR)")
+        vrr_label.set_wrap(False)
+        vrr_label.set_halign(Gtk.Align.START)
+        vrr_label.set_valign(Gtk.Align.START)
+        vrr_label.set_hexpand(True)
+        vrr_label.set_vexpand(True)
+        self.append(vrr_label)
 
         vrr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         vrr_box.set_halign(Gtk.Align.START)
@@ -222,7 +304,13 @@ class MonitorWidget(Gtk.Box):
         self.append(vrr_box)
 
         # ------------------ Orientation Buttons ------------------
-        self.append(Gtk.Label(label="Orientation:"))
+        orientation_label = Gtk.Label(label="Orientation")
+        orientation_label.set_wrap(False)
+        orientation_label.set_halign(Gtk.Align.START)
+        orientation_label.set_valign(Gtk.Align.START)
+        orientation_label.set_hexpand(True)
+        orientation_label.set_vexpand(True)
+        self.append(orientation_label)
 
         rotation_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.append(rotation_box)
@@ -242,6 +330,8 @@ class MonitorWidget(Gtk.Box):
             btn.set_child(image)
             btn.set_tooltip_text(f"Rotate {rotation}°" if rotation != "None" else "No rotation")
             btn.connect("toggled", self.on_rotation_selected, rotation)
+            btn.connect("notify::active", self.on_monitor_toggle_changed)
+
             self.rotation_buttons[rotation] = btn
             self.rotation_group.append(btn)
             rotation_box.append(btn)
@@ -251,18 +341,6 @@ class MonitorWidget(Gtk.Box):
             .orientation-button:checked {
                 background-color: #666;
                 border-radius: 4px;
-            }
-            .rotate-0 {
-                transform: rotate(0deg);
-            }
-            .rotate-90 {
-                transform: rotate(90deg);
-            }
-            .rotate-180 {
-                transform: rotate(180deg);
-            }
-            .rotate-270 {
-                transform: rotate(270deg);
             }
         """)
         Gtk.StyleContext.add_provider_for_display(
@@ -279,7 +357,16 @@ class MonitorWidget(Gtk.Box):
         # ------------------ Flipped Toggle ------------------
         self.flip_switch = Gtk.Switch()
         self.flip_switch.connect("notify::active", self.on_flip_toggled)
-        self.append(Gtk.Label(label="Flip"))
+        self.flip_switch.connect("notify::active", self.on_monitor_toggle_changed)
+
+
+        flip_label = Gtk.Label(label="Flip")
+        flip_label.set_wrap(False)
+        flip_label.set_halign(Gtk.Align.START)
+        flip_label.set_valign(Gtk.Align.START)
+        flip_label.set_hexpand(True)
+        flip_label.set_vexpand(True)
+        self.append(flip_label)
 
         flip_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         flip_box.set_halign(Gtk.Align.START)
@@ -303,33 +390,48 @@ class MonitorWidget(Gtk.Box):
             else:
                 self.rotation_buttons["STANDARD"].set_active(True)
 
+        if self._on_transform_change:
+            self._on_transform_change(self.monitor.get("DESCRIPTION"), self.get_transform())
+
         # ------------------ Scale Slider ------------------
         scale_value = monitor.get("CURRENT", {}).get("SCALE", 1.0)
-        adjustment = Gtk.Adjustment(value=scale_value, lower=1.0, upper=2.5, step_increment=0.25, page_increment=0.25, page_size=0)
+        adjustment = Gtk.Adjustment(
+            value=scale_value,
+            lower=1.0,
+            upper=2.5,
+            step_increment=0.125,  # increment is 0.125 now
+            page_increment=0.125,
+            page_size=0
+        )
         self.scale_slider = Gtk.Scale(
             orientation=Gtk.Orientation.HORIZONTAL,
             adjustment=adjustment
         )
         self.scale_slider.add_css_class("scale-slider")
-        self.scale_slider.set_round_digits(2)
         self.scale_slider.set_draw_value(False)
         self.scale_slider.set_value_pos(Gtk.PositionType.RIGHT)
         self.scale_slider.set_hexpand(True)
         self.scale_slider.set_margin_top(6)
         self.scale_slider.set_margin_bottom(6)
 
-        for val in [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]:
-            self.scale_slider.add_mark(val, Gtk.PositionType.BOTTOM, f"{val:.2f}")
+        # Add marks for every 0.125 increment:
+        mark = 1.0
+        while mark <= 2.5 + 0.0001:  # tiny epsilon so we include 2.5 exactly
+            self.scale_slider.add_mark(mark, Gtk.PositionType.BOTTOM, f"{mark:.3f}")
+            mark += 0.125
 
         self.scale_slider.connect("value-changed", self.on_scale_value_changed)
+        self.scale_slider.connect("value-changed", self.on_monitor_toggle_changed)
 
-        self.append(Gtk.Label(label="Scale Override"))
+        scale_label = Gtk.Label(label="Scale Override")
+        scale_label.set_wrap(False)
+        scale_label.set_halign(Gtk.Align.START)
+        scale_label.set_valign(Gtk.Align.START)
+        scale_label.set_hexpand(True)
+        scale_label.set_vexpand(True)
+        self.append(scale_label)
+
         self.append(self.scale_slider)
-
-        if self._on_transform_change:
-            self._on_transform_change(self.monitor.get("DESCRIPTION"), self.get_transform())
-
-        self.res_combo.connect("notify::selected", self.on_resolution_changed)
 
 
     # ------------------ Methods ------------------
@@ -442,8 +544,9 @@ class MonitorWidget(Gtk.Box):
 
     def on_scale_value_changed(self, scale):
         value = scale.get_value()
-        snapped = round(value * 4) / 4
-        if abs(snapped - value) > 0.001:
+        snapped = round(value * 8) / 8  # 8 steps per 1.0 = 0.125 increments
+        print(snapped)
+        if abs(snapped - value) > 0.0001:
             scale.set_value(snapped)
 
     def get_transform(self):
@@ -540,7 +643,7 @@ def parse_transform(transform_str):
     return angle % 360, is_flipped
 
 class MonitorLayout(Gtk.Fixed):
-    def __init__(self, monitors, notebook, desc_to_tab_index, align=None, arrange=None, order=None, transform_overrides=None, app_ref=None):
+    def __init__(self, monitors, notebook, desc_to_tab_index, align=None, arrange=None, order=None, transform_overrides=None, app_ref=None, apply_active=None):
         super().__init__()
         self.app_ref = app_ref
         self.align = (align or "TOP").upper()
@@ -550,12 +653,14 @@ class MonitorLayout(Gtk.Fixed):
         self.monitor_data = {}
         self.drag_data = {}
         self.set_size_request(1280, 720)
+        self.on_monitor_toggle_changed = apply_active
 
         # CSS Setup
         css = b"""
         .monitor-frame {
-            background-color: #4a90e2;
-            border: 1px solid #ffffff;
+            background-color: #333336;
+            border: 1px solid #4a90e2;
+            border-radius: 10px;
         }
         .overlay-label {
             font-size: 10px;
@@ -566,28 +671,13 @@ class MonitorLayout(Gtk.Fixed):
             border-radius: 4px;
             transition: border 100ms ease-in-out;
         }
-
-        .rotate-0 {
-            transform: rotate(0deg);
-            transform-origin: center center;
-        }
-
-        .rotate-90 {
-            transform: rotate(90deg);
-            transform-origin: top left;
-        }
-
-        .rotate-180 {
-            transform: rotate(180deg);
-            transform-origin: center center;
-        }
-
-        .rotate-270 {
-            transform: rotate(270deg);
-            transform-origin: top right;
-        }
         .panel-bar {
-            background-color: rgba(0, 0, 255, 0.7); /* White at 70% opacity */
+            background-color: #4a90e2;
+            border: 1px solid #4a90e2;
+            border-bottom-left-radius: 10px;
+            border-bottom-right-radius: 10px;
+            border-top-left-radius: 0;
+            border-top-right-radius: 0;
         }
         """
         provider = Gtk.CssProvider()
@@ -683,7 +773,7 @@ class MonitorLayout(Gtk.Fixed):
 
             # --- pane] bars ---
             panel_bar_top = Gtk.Box()
-            panel_bar_top.set_size_request(-1, 10)  # Height = 3px, width = fill
+            panel_bar_top.set_size_request(-1, 8)  # Height = 3px, width = fill
             panel_bar_top.set_halign(Gtk.Align.FILL)
             panel_bar_top.set_valign(Gtk.Align.START)
             panel_bar_top.set_hexpand(True)
@@ -692,7 +782,7 @@ class MonitorLayout(Gtk.Fixed):
             panel_bar_top.set_visible(False)
 
             panel_bar_bottom = Gtk.Box()
-            panel_bar_bottom.set_size_request(-1, 10)  # Height = 3px, width = fill
+            panel_bar_bottom.set_size_request(-1, 8)  # Height = 3px, width = fill
             panel_bar_bottom.set_halign(Gtk.Align.FILL)
             panel_bar_bottom.set_valign(Gtk.Align.END)
             panel_bar_bottom.set_hexpand(True)
@@ -707,6 +797,14 @@ class MonitorLayout(Gtk.Fixed):
                 panel_bar_top.set_visible(False)
                 panel_bar_bottom.set_visible(True)
 
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.set_halign(Gtk.Align.FILL)
+            box.set_valign(Gtk.Align.FILL)
+            box.set_hexpand(True)
+            box.set_vexpand(True)
+            box.append(panel_bar_top)
+            box.append(panel_bar_bottom)
+
             overlay = Gtk.Overlay()
             overlay.set_halign(Gtk.Align.FILL)
             overlay.set_valign(Gtk.Align.FILL)
@@ -714,16 +812,10 @@ class MonitorLayout(Gtk.Fixed):
             overlay.set_vexpand(True)
 
             # Overlay composition
-            overlay.set_child(label)
+            overlay.set_child(box)
+            overlay.add_overlay(label)
             overlay.add_overlay(flip_icon_t)
             overlay.add_overlay(flip_icon_b)
-            overlay.add_overlay(panel_bar_top)
-            overlay.add_overlay(panel_bar_bottom)
-
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            box.set_halign(Gtk.Align.FILL)
-            box.set_valign(Gtk.Align.FILL)
-            box.append(overlay)
 
             # === OUTER ROTATABLE CONTAINER ===
             rotatable = Gtk.Box()
@@ -731,7 +823,7 @@ class MonitorLayout(Gtk.Fixed):
             rotatable.set_valign(Gtk.Align.START)
             rotatable.add_css_class("monitor-frame")
             rotatable.set_size_request(w, h)
-            rotatable.append(box)
+            rotatable.append(overlay)
 
             # === Gesture support in GTK 4 ===
             gesture_click = Gtk.GestureClick()
@@ -887,6 +979,8 @@ class MonitorLayout(Gtk.Fixed):
         if (x, y) != (x_snapped, y_snapped):
             self.flash_widget_border(widget)
 
+        self.on_monitor_toggle_changed()
+
 
     def _move_widget_safely(self, widget, x, y):
         if widget.get_parent() == self:
@@ -918,9 +1012,6 @@ class MonitorLayout(Gtk.Fixed):
         angle, is_flipped = parse_transform(transform)
 
         rotatable_classes = rotatable.get_css_classes()
-        for rclass in rotatable_classes:
-            if "rotate-" in rclass:
-                rotatable.remove_css_class(rclass)
 
         if angle in (90, 270):
             rotatable.add_css_class("vertical")
@@ -935,7 +1026,6 @@ class MonitorLayout(Gtk.Fixed):
         else:
             panel_bar_top.set_visible(False)
             panel_bar_bottom.set_visible(True)
-        #rotatable.add_css_class(f"rotate-{angle}")
 
         flip_icon_b.set_visible(False)
         flip_icon_t.set_visible(False)
@@ -1017,7 +1107,7 @@ class MonitorLayout(Gtk.Fixed):
 
         # --- pane] bars ---
         panel_bar_top = Gtk.Box()
-        panel_bar_top.set_size_request(-1, 10)  # Height = 3px, width = fill
+        panel_bar_top.set_size_request(-1, 8)  # Height = 3px, width = fill
         panel_bar_top.set_halign(Gtk.Align.FILL)
         panel_bar_top.set_valign(Gtk.Align.START)
         panel_bar_top.set_hexpand(True)
@@ -1026,7 +1116,7 @@ class MonitorLayout(Gtk.Fixed):
         panel_bar_top.set_visible(False)
 
         panel_bar_bottom = Gtk.Box()
-        panel_bar_bottom.set_size_request(-1, 10)  # Height = 3px, width = fill
+        panel_bar_bottom.set_size_request(-1, 8)  # Height = 3px, width = fill
         panel_bar_bottom.set_halign(Gtk.Align.FILL)
         panel_bar_bottom.set_valign(Gtk.Align.END)
         panel_bar_bottom.set_hexpand(True)
@@ -1041,6 +1131,14 @@ class MonitorLayout(Gtk.Fixed):
             panel_bar_top.set_visible(False)
             panel_bar_bottom.set_visible(True)
 
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_halign(Gtk.Align.FILL)
+        box.set_valign(Gtk.Align.FILL)
+        box.set_hexpand(True)
+        box.set_vexpand(True)
+        box.append(panel_bar_top)
+        box.append(panel_bar_bottom)
+
         overlay = Gtk.Overlay()
         overlay.set_halign(Gtk.Align.FILL)
         overlay.set_valign(Gtk.Align.FILL)
@@ -1048,16 +1146,10 @@ class MonitorLayout(Gtk.Fixed):
         overlay.set_vexpand(True)
 
         # Overlay composition
-        overlay.set_child(label)
+        overlay.set_child(box)
+        overlay.add_overlay(label)
         overlay.add_overlay(flip_icon_t)
         overlay.add_overlay(flip_icon_b)
-        overlay.add_overlay(panel_bar_top)
-        overlay.add_overlay(panel_bar_bottom)
-
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        box.set_halign(Gtk.Align.FILL)
-        box.set_valign(Gtk.Align.FILL)
-        box.append(overlay)
 
         # === OUTER ROTATABLE CONTAINER ===
         rotatable = Gtk.Box()
@@ -1065,7 +1157,7 @@ class MonitorLayout(Gtk.Fixed):
         rotatable.set_valign(Gtk.Align.START)
         rotatable.add_css_class("monitor-frame")
         rotatable.set_size_request(w, h)
-        rotatable.append(box)
+        rotatable.append(overlay)
 
         # --- Event handling (drag + click) ---
         gesture_click = Gtk.GestureClick()
@@ -1341,8 +1433,8 @@ class MonitorLayout(Gtk.Fixed):
 
         if monitor:
             # Use your custom class
-            label_text = f"{name}\n{orig_width}x{orig_height}"
-            overlay = MonitorOverlay(monitor, f"{label_text}", orig_width, orig_height)
+            label_text = f"{name}"
+            overlay = MonitorOverlay(monitor, f"{label_text}", f"{desc}", orig_width, orig_height, angle)
             overlay.present()
             # Click-through overlay.
             # https://github.com/wmww/gtk4-layer-shell/issues/61#issuecomment-3092952852
@@ -1359,6 +1451,7 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
         self.set_resizable(True)
         self.set_decorated(True)
         self.overlays = []
+        self.new_configs = 1
         # === HeaderBar ===
         header = Gtk.HeaderBar()
         header.set_title_widget(Gtk.Label(label="Way Displays GUI"))
@@ -1379,7 +1472,12 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
         # === Notification Bar ===
         notif_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12, margin_start=12, margin_end=12, margin_top=6, margin_bottom=6)
 
-        self.notify_toggle = Gtk.Switch(hexpand=False, halign=Gtk.Align.END)
+        self.notify_toggle = Gtk.Switch()
+        self.notify_toggle.set_hexpand(False)
+        self.notify_toggle.set_vexpand(False)
+        self.notify_toggle.set_halign(Gtk.Align.END)
+        self.notify_toggle.set_valign(Gtk.Align.CENTER)
+
         notif_bar.append(self.notify_toggle)
         notif_bar.append(Gtk.Label(label="Enable Notifications"))
 
@@ -1411,19 +1509,22 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
         auto_bar.append(Gtk.Label(label="Global Auto Scale (ignored if per-monitor scaling is set.)"))
 
         # === Save Button ===
-        save_btn = Gtk.Button(label="Apply")
-        save_btn.connect("clicked", self.save_config)
+        self.save_btn = Gtk.Button(label="Apply")
+        self.save_btn.connect("clicked", self.save_config)
+        self.save_btn.set_halign(Gtk.Align.END)
+        self.save_btn.set_hexpand(True)
+        self.save_btn.set_sensitive(False)
 
         save_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, margin_start=12, margin_end=12, margin_top=6, margin_bottom=6)
-        save_bar.append(save_btn)
+        save_bar.append(self.save_btn)
 
         # === Main Content ===
         main_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         main_content.append(self.layout_frame)
         main_content.append(self.monitors_notebook)
+        main_content.append(save_bar)
         main_content.append(notif_bar)
         main_content.append(auto_bar)
-        main_content.append(save_bar)
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_name("main-scroll")
@@ -1439,32 +1540,16 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
 
         # === CSS ===
         css = b"""
-        #custom-titlebar {
-            background-color: #333336;
-            padding: 6px;
-        }
-
-        #custom-titlebar GtkLabel {
-            color: white;
-            font-weight: bold;
-        }
-
-        #custom-titlebar GtkButton {
-            background-color: transparent;
-            border: none;
-            color: white;
-            margin: 0 4px;
-            border-radius: 4px;
-            padding: 2px 6px;
-        }
-
-        #custom-titlebar GtkButton:hover {
-            background-color: rgba(255, 255, 255, 0.15);
-        }
-
         #main-scroll slider {
             min-width: 16px;
             min-height: 16px;
+        }
+        notebook tab:not(:checked) {
+            border-top: 2px solid @theme_fg_color;
+            border-left: 2px solid @theme_fg_color;
+            border-right: 2px solid @theme_fg_color;
+            border-radius: 6px 6px 0 0;  /* optional rounded top corners */
+            border-color: #1e1e20;
         }
         """
 
@@ -1480,6 +1565,9 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
         self.load_monitor_data()
         self.reload_layout()
 
+    def on_monitor_toggle_changed(self, toggle=None, params=None):
+        if self.new_configs == 0:
+            self.save_btn.set_sensitive(True)
 
     def load_monitor_data(self):
         data = CONFIG_DATA
@@ -1549,6 +1637,7 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
                 on_transform_change=self.on_transform_change,
                 on_resolution_change=self.on_resolution_change,
                 layout_area=self.layout_area,
+                apply_active=self.on_monitor_toggle_changed,
             )
             widget.app = self
             self.monitor_widgets.append(widget)
@@ -1578,7 +1667,8 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             self.monitor_tab_indices,
             align=align_setting,
             arrange=arrange,
-            app_ref=self
+            app_ref=self,
+            apply_active=self.on_monitor_toggle_changed
         )
 
         # Apply transforms to layout
@@ -1601,6 +1691,7 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
                 entry.set_text(text + "")
                 entry.set_position(-1)
             entry.handler_unblock_by_func(self.on_callback_entry_changed)
+            ipc_operation("CFG_SET", f"CFG:\n  CALLBACK_CMD: {self.callback_entry.get_text().strip()}")
 
     def on_notify_toggle(self, switch, _param):
         enabled = switch.get_active()
@@ -1965,15 +2056,18 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             self.arrange_mode = cfg["ARRANGE"]
             #ipc_operation("CFG_SET", f"CFG:\n  ARRANGE: {cfg['ARRANGE']}\n  ALIGN: {cfg['ALIGN']}")
 
-        print("SET")
-        print(yaml.dump(dict(CFG = cfg)))
+        # Debug
+        #print("SET")
+        #print(yaml.dump(dict(CFG = cfg)))
 
-        print("DEL")
-        print(yaml.dump(dict(CFG = del_cfg)))
+        #print("DEL")
+        #print(yaml.dump(dict(CFG = del_cfg)))
 
         ipc_operation("CFG_DEL", yaml.dump(dict(CFG = del_cfg)))
         ipc_operation("CFG_SET", yaml.dump(dict(CFG = cfg)))
         ipc_operation("CFG_WRITE")
+        self.new_configs = 0
+        self.save_btn.set_sensitive(False)
         get_config_data()
         GLib.timeout_add(250, self.reload_layout)
 
@@ -2011,7 +2105,8 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
             arrange=arrange,
             order=order,
             transform_overrides=transform_overrides,
-            app_ref=self
+            app_ref=self,
+            apply_active=self.on_monitor_toggle_changed
         )
 
         for rotatable, meta in self.layout_area.monitor_data.items():
@@ -2043,6 +2138,7 @@ class WayDisplaysApp(Gtk.ApplicationWindow):
                 meta["name"],
                 app_ref=self
             )
+        self.new_configs = 0
 
 class MainApp(Gtk.Application):
     def __init__(self):
